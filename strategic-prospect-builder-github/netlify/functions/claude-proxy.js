@@ -24,7 +24,6 @@ export default async (request, context) => {
   } catch (e) {
     return new Response(JSON.stringify({ error: 'Invalid JSON body.' }), { status: 400 });
   }
-
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -35,7 +34,7 @@ export default async (request, context) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 4096,
+        max_tokens: 1200,
         messages: [{ role: 'user', content: prompt }]
       })
     });
@@ -53,5 +52,5 @@ export default async (request, context) => {
 };
 
 export const config = {
-  path: '/.netlify/functions/claude-proxy'
-};
+  path: '/api/claude-proxy'
+};  
