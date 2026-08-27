@@ -1355,7 +1355,13 @@ async function callClaudeAPI(prompt) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })
     });
-    const data = await response.json();
+    const rawText = await response.text();
+    let data;
+    try {
+        data = JSON.parse(rawText);
+    } catch (e) {
+        throw new Error(`Server returned an unexpected response (status ${response.status}): ${rawText.slice(0, 200) || '(empty)'}`);
+    }
     if (!response.ok) {
         throw new Error(data.error || `Request failed: ${response.status}`);
     }
