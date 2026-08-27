@@ -36,22 +36,3 @@ export default async (request, context) => {
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: 1200,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return new Response(JSON.stringify({ error: data?.error?.message || `Anthropic API error: ${response.status}` }), { status: response.status });
-    }
-
-    return new Response(JSON.stringify({ text: data.content[0].text }), { status: 200 });
-  } catch (err) {
-    return new Response(JSON.stringify({ error: 'Request to Anthropic failed: ' + err.message }), { status: 500 });
-  }
-};
-
-export const config = {
-  path: '/api/claude-proxy'
-};
