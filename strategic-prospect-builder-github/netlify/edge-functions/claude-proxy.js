@@ -35,7 +35,7 @@ export default async (request, context) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 4096,
+        max_tokens: 1200,
         messages: [{ role: 'user', content: prompt }]
       })
     });
