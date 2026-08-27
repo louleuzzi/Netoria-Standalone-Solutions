@@ -35,12 +35,14 @@ export default async (request, context) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 1200,
+        max_tokens: 2200,
         messages: [{ role: 'user', content: prompt }]
       })
     });
 
     const data = await response.json();
+    console.log('RAW_CLAUDE_RESPONSE:', JSON.stringify(data));
+
     if (!response.ok) {
       return new Response(JSON.stringify({ error: data?.error?.message || `Anthropic API error: ${response.status}` }), { status: response.status });
     }
