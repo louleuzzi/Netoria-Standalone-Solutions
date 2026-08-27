@@ -1356,16 +1356,12 @@ async function callClaudeAPI(prompt) {
         body: JSON.stringify({ prompt })
     });
     const rawText = await response.text();
-    let data;
-    try {
-        data = JSON.parse(rawText);
-    } catch (e) {
-        throw new Error(`Server returned an unexpected response (status ${response.status}): ${rawText.slice(0, 200) || '(empty)'}`);
-    }
     if (!response.ok) {
-        throw new Error(data.error || `Request failed: ${response.status}`);
+        let errMsg = `Request failed: ${response.status}`;
+        try { errMsg = JSON.parse(rawText).error || errMsg; } catch (e) {}
+        throw new Error(errMsg);
     }
-    return data.text;
+    return rawText;
 }
 
 function extractJSON(raw) {
