@@ -17,7 +17,7 @@ export default async (request, context) => {
   let prompt;
   try {
     const body = await request.json();
-    prompt = body.prompt;
+    console.log('RAW_CLAUDE_RESPONSE:', JSON.stringify(data));
     if (!prompt || typeof prompt !== 'string') {
       return new Response(JSON.stringify({ error: 'Missing "prompt" in request body.' }), { status: 400 });
     }
