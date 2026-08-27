@@ -1,29 +1,28 @@
-// Netlify serverless function that proxies requests to the Anthropic API.
+// Netlify Edge Function that proxies requests to the Anthropic API.
+// Edge Functions have a far higher execution time limit than standard
+// serverless Functions, which is required for AI-generation calls.
 // The API key lives only in Netlify's environment variables (server-side),
 // never in the browser, so visitors never see or need their own key.
 
-exports.handler = async (event) => {
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }) };
+export default async (request, context) => {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405 });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = Deno.env.get('ANTHROPIC_API_KEY');
   if (!apiKey) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: 'Server is not configured with an API key. Set ANTHROPIC_API_KEY in Netlify environment variables.' })
-    };
+    return new Response(JSON.stringify({ error: 'Server is not configured with an API key.' }), { status: 500 });
   }
 
   let prompt;
   try {
-    const body = JSON.parse(event.body || '{}');
+    const body = await request.json();
     prompt = body.prompt;
     if (!prompt || typeof prompt !== 'string') {
-      return { statusCode: 400, body: JSON.stringify({ error: 'Missing "prompt" in request body.' }) };
+      return new Response(JSON.stringify({ error: 'Missing "prompt" in request body.' }), { status: 400 });
     }
   } catch (e) {
-    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body.' }) };
+    return new Response(JSON.stringify({ error: 'Invalid JSON body.' }), { status: 400 });
   }
 
   try {
@@ -36,7 +35,7 @@ exports.handler = async (event) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
+        max_tokens: 4096,
         messages: [{ role: 'user', content: prompt }]
       })
     });
@@ -44,17 +43,15 @@ exports.handler = async (event) => {
     const data = await response.json();
 
     if (!response.ok) {
-      return {
-        statusCode: response.status,
-        body: JSON.stringify({ error: data?.error?.message || `Anthropic API error: ${response.status}` })
-      };
+      return new Response(JSON.stringify({ error: data?.error?.message || `Anthropic API error: ${response.status}` }), { status: response.status });
     }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ text: data.content[0].text })
-    };
+    return new Response(JSON.stringify({ text: data.content[0].text }), { status: 200 });
   } catch (err) {
-    return { statusCode: 500, body: JSON.stringify({ error: 'Request to Anthropic failed: ' + err.message }) };
+    return new Response(JSON.stringify({ error: 'Request to Anthropic failed: ' + err.message }), { status: 500 });
   }
+};
+
+export const config = {
+  path: '/.netlify/functions/claude-proxy'
 };
