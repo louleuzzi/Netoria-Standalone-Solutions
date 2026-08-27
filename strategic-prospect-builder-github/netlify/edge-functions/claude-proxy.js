@@ -1,6 +1,6 @@
 // Netlify Edge Function that proxies requests to the Anthropic API.
-// Edge Functions have a far higher execution time limit than standard
-// serverless Functions, which is required for AI-generation calls.
+// Streams the response back as it's generated so we never hit Netlify's
+// 40-second response-header timeout, regardless of report length.
 // The API key lives only in Netlify's environment variables (server-side),
 // never in the browser, so visitors never see or need their own key.
 
@@ -25,32 +25,60 @@ export default async (request, context) => {
     return new Response(JSON.stringify({ error: 'Invalid JSON body.' }), { status: 400 });
   }
 
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1500,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
+  const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4096,
+      stream: true,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
 
-    const data = await response.json();
-    console.log('RAW_CLAUDE_RESPONSE:', JSON.stringify(data));
-
-    if (!response.ok) {
-      return new Response(JSON.stringify({ error: data?.error?.message || `Anthropic API error: ${response.status}` }), { status: response.status });
-    }
-
-    return new Response(JSON.stringify({ text: data.content[0].text }), { status: 200 });
-  } catch (err) {
-    return new Response(JSON.stringify({ error: 'Request to Anthropic failed: ' + err.message }), { status: 500 });
+  if (!anthropicResponse.ok || !anthropicResponse.body) {
+    const errText = await anthropicResponse.text();
+    return new Response(JSON.stringify({ error: `Anthropic API error: ${anthropicResponse.status} ${errText}` }), { status: anthropicResponse.status || 500 });
   }
+
+  const reader = anthropicResponse.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6).trim();
+            if (dataStr === '[DONE]') continue;
+            try {
+              const evt = JSON.parse(dataStr);
+              if (evt.type === 'content_block_delta' && evt.delta && evt.delta.text) {
+                controller.enqueue(encoder.encode(evt.delta.text));
+              }
+            } catch (e) { /* ignore partial/incomplete lines */ }
+          }
+        }
+      }
+      controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+  });
 };
 
 export const config = {
