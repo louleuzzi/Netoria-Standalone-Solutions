@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script>window.__nativeFetch = window.fetch.bind(window);</script>
+    <script>
+    (function() {
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const newRequestId = cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function() { return cryptoObj.randomUUID(); }
+            : function() { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+            log: (...args) => { originalConsole.log(...args); realParent.postMessage({ type: 'console', message: args.join(' ') }, '*'); },
+            error: (...args) => { originalConsole.error(...args); realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*'); },
+            warn: (...args) => { originalConsole.warn(...args); realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*'); }
+        };
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        window.claude = {
+            complete: (prompt) => {
+                return new Promise((resolve, reject) => {
+                    const id = newRequestId();
+                    callbacksMap.set(id, { resolve, reject });
+                    realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+                });
+            }
+        };
+        window.storage = {
+            get: (key, shared=false) => new Promise((resolve, reject) => { const id = newRequestId(); callbacksMap.set(id, { resolve, reject }); realParent.postMessage({ type: 'storageGet', id, key, shared }, '*'); }),
+            set: (key, value, shared=false) => new Promise((resolve, reject) => { const id = newRequestId(); callbacksMap.set(id, { resolve, reject }); realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*'); }),
+            delete: (key, shared=false) => new Promise((resolve, reject) => { const id = newRequestId(); callbacksMap.set(id, { resolve, reject }); realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*'); }),
+            list: (prefix, shared=false) => new Promise((resolve, reject) => { const id = newRequestId(); callbacksMap.set(id, { resolve, reject }); realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*'); })
+        };
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => { const blobId = `blob-${Date.now()}-${Math.random()}`; pendingBlobs.set(blobId, blob); return `blob-request://${blobId}`; };
+        URL.revokeObjectURL = (url) => { const blobId = url.replace("blob-request://", ""); pendingBlobs.delete(blobId); };
+        const getBlobFromURL = (url) => { const blobId = url.replace("blob-request://", ""); return pendingBlobs.get(blobId); };
+        window.fetch = (url, init={}) => {
+            return new Promise((resolve, reject) => {
+                const id = newRequestId();
+                const channelId = `fetch-${id}-${Date.now()}`;
+                callbacksMap.set(id, {
+                    resolve: (response) => {
+                        if (response.status === 204 || response.status === 205 || response.status === 304) {
+                            try { resolve(new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers })); } catch (err) { reject(new TypeError('Bridge fetch: unconstructable response (status ' + response.status + ')')); }
+                            return;
+                        }
+                        const stream = new ReadableStream({ start(controller) { streamControllers.set(channelId, controller); }, cancel() { streamControllers.delete(channelId); } });
+                        try { resolve(new Response(stream, { status: response.status, statusText: response.statusText, headers: response.headers })); } catch (err) { streamControllers.delete(channelId); reject(new TypeError('Bridge fetch: unconstructable response (status ' + response.status + ')')); }
+                    },
+                    reject, channelId
+                });
+                realParent.postMessage({ type: 'proxyFetch', id, url, init, channelId }, '*');
+            });
+        };
+        window.addEventListener('message', async (event) => {
+            if (event.source !== realParent) return;
+            if (event.data.type === 'claudeComplete') {
+                const callback = callbacksMap.get(event.data.id);
+                if (!callback) return;
+                if (event.data.error) { callback.reject(new Error(event.data.error)); } else { callback.resolve(event.data.completion); }
+                callbacksMap.delete(event.data.id);
+            } else if (event.data.type === 'proxyFetchResponse') {
+                const callback = callbacksMap.get(event.data.id);
+                if (!callback) return;
+                if (event.data.error) { callback.reject(new Error(event.data.error)); callbacksMap.delete(event.data.id); }
+                else { callback.resolve({ status: event.data.status, statusText: event.data.statusText, headers: event.data.headers }); if (!event.data.body) callbacksMap.delete(event.data.id); }
+            } else if (event.data.type === 'proxyFetchStream') {
+                const controller = streamControllers.get(event.data.channelId);
+                if (controller) {
+                    if (event.data.error) { controller.error(new Error(event.data.error)); streamControllers.delete(event.data.channelId); }
+                    else if (event.data.done) { controller.close(); streamControllers.delete(event.data.channelId); const callback = Array.from(callbacksMap.entries()).find(([_, value]) => value.channelId === event.data.channelId); if (callback) callbacksMap.delete(callback[0]); }
+                    else if (event.data.chunk) { controller.enqueue(new Uint8Array(event.data.chunk)); }
+                }
+            } else if (event.data.type === 'storageGet' || event.data.type === 'storageSet' || event.data.type === 'storageDelete' || event.data.type === 'storageList') {
+                const callback = callbacksMap.get(event.data.id);
+                if (!callback) return;
+                if (event.data.error) { callback.reject(new Error(event.data.error)); } else { callback.resolve(event.data.result); }
+                callbacksMap.delete(event.data.id);
+            }
+        });
+        window.addEventListener('click', (event) => {
+            const isEl = event.target instanceof HTMLElement;
+            if (!isEl) return;
+            const linkEl = event.target.closest("a");
+            if (!linkEl || !linkEl.href) return;
+            event.preventDefault(); event.stopImmediatePropagation();
+            if (linkEl.href.startsWith("blob-request:")) {
+                const blob = getBlobFromURL(linkEl.href);
+                if (!blob) return;
+                void blob.arrayBuffer().then((data) => { realParent.postMessage({ type: "downloadFile", filename: linkEl.download, data, mimeType: blob.type || "application/octet-stream" }); });
+            } else if (linkEl.href.startsWith("data:")) {
+                const [header, base64Data] = linkEl.href.split(",");
+                const mimeMatch = header.match(/data:([^;]+)/);
+                const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+                const binaryString = atob(base64Data);
+                const data = Uint8Array.from(binaryString, (c) => c.charCodeAt(0)).buffer;
+                realParent.postMessage({ type: "downloadFile", filename: linkEl.download, data, mimeType });
+            } else {
+                let linkUrl; try { linkUrl = new URL(linkEl.href); } catch (error) { return; }
+                if (linkUrl.hostname === window.location.hostname) return;
+                realParent.postMessage({ type: 'openExternal', href: linkEl.href }, '*');
+            }
+        });
+        const originalOpen = window.open;
+        window.open = function(url) { realParent.postMessage({ type: "openExternal", href: url }, "*"); };
+        window.addEventListener('error', (event) => { realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*'); });
+    })();
+    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discovery Gap Profiler&#8482; &#8212; The Sales Athlete System&#8482;</title>
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700;900&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+        --bone: #FAFAF7; --ink: #141B2D; --gold: #C5821E; --gold-light: #F5E6CC; --gold-dim: #9E6515;
+        --border: #E2E8F0; --card: #FFFFFF; --red: #D14545; --red-50: #FFF5F5; --red-200: #FEB2B2;
+        --red-700: #C53030; --purple: #7C5DE0; --blue: #5B8FB9; --teal: #1D9E75;
+        --muted-1: #475569; --muted-2: #64748B; --muted-3: #94A3B8;
+        --green-band: #166534; --green-bg: #F0FDF4; --green-border: #BBF7D0;
+        --gold-band: #92400E; --gold-bg: #FFFBEB; --gold-border: #FDE68A;
+        --red-band: #991B1B; --red-bg: #FEF2F2; --red-border: #FECACA;
+    }
+    html { scroll-behavior: smooth; }
+    body { font-family: 'Inter', sans-serif; background: var(--bone); color: var(--ink); line-height: 1.6; min-height: 100vh; }
+    .spp-heading { font-family: 'Playfair Display', serif; }
+    .app { max-width: 780px; margin: 0 auto; padding: 0 20px; }
+    .top-bar { border-bottom: 1px solid var(--border); padding: 16px 0; }
+    .top-bar-inner { max-width: 780px; margin: 0 auto; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; }
+    .brand-lockup { display: flex; flex-direction: column; gap: 2px; }
+    .brand-name { font-family: 'Playfair Display', serif; font-size: 15px; font-weight: 700; color: var(--ink); }
+    .brand-sub { font-size: 10px; font-weight: 500; color: var(--muted-2); letter-spacing: 0.08em; text-transform: uppercase; }
+    .tme-lockup { display: flex; align-items: center; gap: 7px; }
+    .tme-logo { width: 22px; height: 22px; border-radius: 5px; object-fit: cover; flex-shrink: 0; }
+    .netoria-badge { font-size: 10px; color: var(--muted-3); letter-spacing: 0.05em; text-transform: uppercase; }
+    .phase-bar { display: flex; align-items: center; padding: 20px 0 0; margin-bottom: 32px; }
+    .phase-step { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted-3); transition: color 0.2s; }
+    .phase-step.active { color: var(--gold); }
+    .phase-step.done { color: var(--muted-2); }
+    .phase-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); transition: background 0.2s; flex-shrink: 0; }
+    .phase-step.active .phase-dot { background: var(--gold); }
+    .phase-step.done .phase-dot { background: var(--muted-3); }
+    .phase-line { flex: 1; height: 1px; background: var(--border); margin: 0 8px; min-width: 8px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 32px; margin-bottom: 20px; }
+    .card-sm { padding: 24px; border-radius: 12px; }
+    .btn-primary { background: var(--gold); color: white; border: none; border-radius: 8px; padding: 14px 28px; font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s, transform 0.1s; }
+    .btn-primary:hover { background: var(--gold-dim); transform: translateY(-1px); }
+    .btn-ghost { background: transparent; color: var(--muted-1); border: 1px solid var(--border); border-radius: 8px; padding: 12px 22px; font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; transition: border-color 0.15s, color 0.15s; }
+    .btn-ghost:hover { border-color: var(--muted-2); color: var(--ink); }
+    .btn-next { background: var(--gold); color: white; border: none; border-radius: 8px; padding: 12px 24px; font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s, opacity 0.15s; }
+    .btn-next:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-next:not(:disabled):hover { background: var(--gold-dim); }
+    .btn-back { background: transparent; border: none; color: var(--muted-2); font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; padding: 8px 0; }
+    .btn-back:hover { color: var(--ink); }
+    .btn-share { display: inline-flex; align-items: center; gap: 8px; background: var(--ink); color: white; border: none; border-radius: 8px; padding: 11px 20px; font-family: 'Inter', sans-serif; font-size: 13px; font-weight: 600; cursor: pointer; margin-left: 10px; }
+    .btn-share:hover { background: #1e293b; }
+    .btn-download-result { display: inline-flex; align-items: center; gap: 8px; background: var(--bone); color: var(--muted-1); border: 1px solid var(--border); border-radius: 8px; padding: 11px 20px; font-family: 'Inter', sans-serif; font-size: 13px; font-weight: 600; cursor: pointer; margin-left: 10px; }
+    .btn-download-result:hover { border-color: var(--gold); color: var(--gold-dim); }
+    .btn-download { display: inline-flex; align-items: center; gap: 7px; background: transparent; color: var(--muted-1); border: 1px solid var(--border); border-radius: 8px; padding: 7px 14px; font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .btn-download:hover { border-color: var(--gold); color: var(--gold-dim); background: var(--gold-light); }
+    .intro-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); margin-bottom: 16px; }
+    .intro-headline { font-family: 'Playfair Display', serif; font-size: clamp(26px, 5vw, 42px); font-weight: 900; line-height: 1.15; color: var(--ink); margin-bottom: 20px; }
+    .intro-headline em { font-style: italic; color: var(--gold); }
+    .intro-body { font-size: 15px; color: var(--muted-1); margin-bottom: 28px; line-height: 1.7; }
+    .value-props { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 32px; }
+    @media (max-width: 560px) { .value-props { grid-template-columns: 1fr; } }
+    .value-prop { background: var(--bone); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .value-prop-label { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+    .value-prop-text { font-size: 13px; color: var(--muted-1); line-height: 1.5; }
+    .cta-row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .section-label { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted-2); margin-bottom: 8px; }
+    .section-title { font-family: 'Playfair Display', serif; font-size: 22px; font-weight: 700; color: var(--ink); margin-bottom: 6px; }
+    .section-desc { font-size: 14px; color: var(--muted-2); margin-bottom: 24px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+    @media (max-width: 500px) { .form-grid { grid-template-columns: 1fr; } }
+    .form-group { display: flex; flex-direction: column; gap: 6px; }
+    .form-group.full { grid-column: 1 / -1; }
+    .form-label { font-size: 12px; font-weight: 600; color: var(--muted-1); }
+    .form-select, .form-textarea, .form-input { font-family: 'Inter', sans-serif; font-size: 14px; color: var(--ink); background: var(--bone); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; transition: border-color 0.15s; outline: none; width: 100%; }
+    .form-select:focus, .form-textarea:focus, .form-input:focus { border-color: var(--gold); }
+    .form-textarea { resize: vertical; min-height: 70px; line-height: 1.5; }
+    .char-count { font-size: 11px; color: var(--muted-3); text-align: right; }
+    .dim-nav { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 20px; }
+    .dim-pill { padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; border: 1.5px solid var(--border); background: white; color: var(--muted-2); cursor: default; transition: all 0.2s; }
+    .dim-pill.active { background: var(--ink); border-color: var(--ink); color: white; }
+    .dim-pill.complete { background: var(--green-bg); border-color: var(--green-border); color: var(--green-band); }
+    .quiz-progress-bar { height: 3px; background: var(--border); border-radius: 2px; margin-bottom: 6px; overflow: hidden; }
+    .quiz-progress-fill { height: 100%; background: var(--gold); border-radius: 2px; transition: width 0.35s ease; }
+    .quiz-progress-label { font-size: 11px; color: var(--muted-3); margin-bottom: 16px; }
+    .dim-label-eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); margin-bottom: 4px; }
+    .dim-context-note { font-size: 12px; color: var(--muted-2); margin-bottom: 14px; font-style: italic; line-height: 1.55; padding: 10px 14px; background: var(--bone); border-radius: 8px; border-left: 2px solid var(--gold); }
+    .question-number { font-size: 11px; font-weight: 600; color: var(--muted-3); margin-bottom: 8px; }
+    .question-title { font-family: 'Playfair Display', serif; font-size: 19px; font-weight: 700; color: var(--ink); margin-bottom: 6px; line-height: 1.35; }
+    .question-probe { font-size: 12px; color: var(--red); font-weight: 600; margin-bottom: 16px; font-style: italic; }
+    .answer-options { display: flex; flex-direction: column; gap: 9px; margin-bottom: 16px; }
+    .answer-option { display: flex; align-items: flex-start; gap: 12px; padding: 13px 15px; border: 1.5px solid var(--border); border-radius: 10px; cursor: pointer; transition: all 0.15s; background: white; }
+    .answer-option:hover { border-color: var(--gold); background: #FFFDF8; }
+    .answer-option.selected { border-color: var(--gold); background: var(--gold-light); }
+    .answer-letter { font-size: 12px; font-weight: 700; color: var(--muted-3); min-width: 16px; padding-top: 1px; flex-shrink: 0; }
+    .answer-option.selected .answer-letter { color: var(--gold-dim); }
+    .answer-text { font-size: 13px; color: var(--muted-1); line-height: 1.5; }
+    .answer-option.selected .answer-text { color: var(--ink); }
+    .source-tagger { background: var(--bone); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; margin-bottom: 20px; animation: fadeIn 0.2s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    .source-label { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-2); margin-bottom: 9px; }
+    .source-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+    .source-chip { padding: 5px 13px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1.5px solid var(--border); background: white; cursor: pointer; transition: all 0.15s; color: var(--muted-1); }
+    .source-chip:hover { border-color: var(--gold); color: var(--gold-dim); }
+    .source-chip.active { background: var(--ink); border-color: var(--ink); color: white; }
+    .source-desc { font-size: 11px; color: var(--muted-3); margin-top: 7px; line-height: 1.5; }
+    .quiz-nav { display: flex; align-items: center; justify-content: space-between; }
+    .full-reveal-tag { display: inline-flex; align-items: center; gap: 6px; background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 20px; padding: 5px 14px; font-size: 12px; font-weight: 600; color: #166534; margin-bottom: 20px; }
+    .score-card { border-radius: 16px; padding: 32px; margin-bottom: 20px; }
+    .score-card.green { background: var(--green-bg); border: 1px solid var(--green-border); }
+    .score-card.gold { background: var(--gold-bg); border: 1px solid var(--gold-border); }
+    .score-card.red { background: var(--red-bg); border: 1px solid var(--red-border); }
+    .score-top { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
+    .score-number { font-family: 'Playfair Display', serif; font-size: 64px; font-weight: 900; line-height: 1; }
+    .score-card.green .score-number { color: var(--green-band); }
+    .score-card.gold .score-number { color: var(--gold-band); }
+    .score-card.red .score-number { color: var(--red-band); }
+    .score-denom { font-family: 'Inter', sans-serif; font-size: 18px; font-weight: 400; opacity: 0.5; vertical-align: super; margin-left: 2px; }
+    .score-sublabel { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.55; margin-top: 4px; }
+    .band-pill { display: inline-flex; align-items: center; padding: 6px 16px; border-radius: 20px; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0; transition: opacity 0.4s ease; }
+    .band-pill.revealed { opacity: 1; }
+    .band-pill.green { background: var(--green-band); color: white; }
+    .band-pill.gold { background: var(--gold-band); color: white; }
+    .band-pill.red { background: var(--red-band); color: white; }
+    .score-headline { font-family: 'Playfair Display', serif; font-size: 21px; font-weight: 700; margin-bottom: 10px; line-height: 1.25; opacity: 0; transform: translateY(6px); transition: opacity 0.4s ease, transform 0.4s ease; }
+    .score-headline.revealed { opacity: 1; transform: translateY(0); }
+    .score-card.green .score-headline { color: var(--green-band); }
+    .score-card.gold .score-headline { color: var(--gold-band); }
+    .score-card.red .score-headline { color: var(--red-band); }
+    .score-body { font-size: 14px; line-height: 1.7; opacity: 0; transform: translateY(6px); transition: opacity 0.4s ease 0.1s, transform 0.4s ease 0.1s; }
+    .score-body.revealed { opacity: 1; transform: translateY(0); }
+    .score-card.green .score-body { color: #14532D; }
+    .score-card.gold .score-body { color: #78350F; }
+    .score-card.red .score-body { color: #7F1D1D; }
+    .section-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 16px; }
+    .section-title-sm { font-family: 'Playfair Display', serif; font-size: 18px; font-weight: 700; color: var(--ink); }
+    .dim-block { margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+    .dim-block:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+    .dim-block-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .dim-block-name { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted-2); }
+    .dim-block-score-wrap { display: flex; align-items: center; gap: 8px; }
+    .dim-block-score { font-size: 12px; font-weight: 700; }
+    .dim-narrative { font-size: 13px; color: var(--muted-1); line-height: 1.65; margin-bottom: 12px; font-style: italic; padding: 10px 14px; background: var(--bone); border-radius: 8px; }
+    .dim-row { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; }
+    .dim-label { font-size: 12px; color: var(--muted-1); width: 220px; flex-shrink: 0; }
+    .dim-bar-track { flex: 1; height: 7px; background: var(--border); border-radius: 4px; overflow: hidden; }
+    .dim-bar-fill { height: 100%; border-radius: 4px; transition: width 0.55s ease; }
+    .dim-bar-fill.sev-1 { background: #22C55E; } .dim-bar-fill.sev-2 { background: var(--gold); } .dim-bar-fill.sev-3 { background: #F97316; } .dim-bar-fill.sev-4 { background: var(--red); }
+    .dim-score { font-size: 11px; font-weight: 600; width: 20px; text-align: right; flex-shrink: 0; }
+    .dim-score.sev-1 { color: #16A34A; } .dim-score.sev-2 { color: var(--gold-dim); } .dim-score.sev-3 { color: #EA580C; } .dim-score.sev-4 { color: var(--red); }
+    .dim-risk-tag { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 20px; }
+    .dim-risk-tag.high { background: var(--red-50); color: var(--red-700); border: 1px solid var(--red-200); }
+    .dim-risk-tag.med { background: #FFFBEB; color: #92400E; border: 1px solid #FDE68A; }
+    .dim-risk-tag.low { background: var(--green-bg); color: var(--green-band); border: 1px solid var(--green-border); }
+    @keyframes flagReveal { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes flagShake { 0%,100%{transform:translateX(0)} 15%{transform:translateX(-5px)} 30%{transform:translateX(5px)} 45%{transform:translateX(-4px)} 60%{transform:translateX(4px)} 75%{transform:translateX(-2px)} 90%{transform:translateX(2px)} }
+    .flag-card { background: var(--red-50); border: 1px solid var(--red-200); border-radius: 12px; padding: 20px 22px; margin-bottom: 20px; display: flex; gap: 14px; align-items: flex-start; animation: flagReveal 0.3s ease forwards, flagShake 0.6s ease 0.35s; opacity: 0; }
+    .flag-icon { font-size: 18px; flex-shrink: 0; }
+    .flag-title { font-size: 12px; font-weight: 700; color: var(--red-700); margin-bottom: 6px; letter-spacing: 0.02em; text-transform: uppercase; }
+    .flag-body { font-size: 13px; color: var(--red-700); line-height: 1.6; }
+    .flag-items { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+    .flag-item { font-size: 12px; color: var(--red-700); padding: 5px 10px; background: white; border-radius: 6px; border: 1px solid var(--red-200); }
+    .debrief-card { background: var(--ink); border-radius: 16px; padding: 30px 34px; margin-bottom: 20px; }
+    .debrief-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; padding-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .debrief-eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+    .debrief-title { font-family: 'Playfair Display', serif; font-size: 22px; font-weight: 700; color: white; margin-bottom: 4px; }
+    .debrief-subtitle { font-size: 12px; color: #94A3B8; }
+    .forecast-rec-badge { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+    .forecast-rec-label { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted-3); }
+    .forecast-rec-value { font-size: 12px; font-weight: 700; padding: 7px 18px; border-radius: 20px; }
+    .forecast-rec-value.proceed { background: #D1FAE5; color: #065F46; }
+    .forecast-rec-value.confirm { background: #FEF3C7; color: #92400E; }
+    .forecast-rec-value.return { background: #FEE2E2; color: #991B1B; }
+    .forecast-rec-value.restart { background: #4B0000; color: #FCA5A5; border: 1px solid #991B1B; }
+    .debrief-section { margin-bottom: 22px; }
+    .debrief-section:last-child { margin-bottom: 0; }
+    .debrief-section-label { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted-3); margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .debrief-risk-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .debrief-risk-pill { font-size: 11px; font-weight: 600; padding: 5px 13px; border-radius: 20px; }
+    .debrief-risk-pill.high { background: rgba(209,69,69,0.2); color: #FCA5A5; border: 1px solid rgba(209,69,69,0.3); }
+    .debrief-risk-pill.med { background: rgba(197,130,30,0.2); color: #FDE68A; border: 1px solid rgba(197,130,30,0.3); }
+    .debrief-risk-pill.low { background: rgba(29,158,117,0.15); color: #6EE7B7; border: 1px solid rgba(29,158,117,0.3); }
+    .debrief-narrative { font-size: 14px; color: #CBD5E1; line-height: 1.7; padding: 16px 18px; background: rgba(255,255,255,0.04); border-radius: 10px; border-left: 3px solid var(--gold); }
+    .debrief-questions { display: flex; flex-direction: column; gap: 12px; }
+    .debrief-q { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; background: rgba(255,255,255,0.04); border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); }
+    .debrief-q-num { font-size: 11px; font-weight: 700; color: var(--gold); flex-shrink: 0; min-width: 18px; margin-top: 1px; }
+    .debrief-q-text { font-size: 13px; color: #CBD5E1; line-height: 1.6; }
+    .debrief-q-why { font-size: 11px; color: #64748B; margin-top: 5px; line-height: 1.5; font-style: italic; }
+    .debrief-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 520px) { .debrief-actions { grid-template-columns: 1fr; } }
+    .debrief-action { padding: 14px 16px; background: rgba(255,255,255,0.04); border-radius: 10px; border: 1px solid rgba(255,255,255,0.08); }
+    .debrief-action-label { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--gold); margin-bottom: 5px; }
+    .debrief-action-text { font-size: 12px; color: #94A3B8; line-height: 1.55; }
+    .archetype-count { font-size: 12px; font-weight: 600; color: var(--muted-2); }
+    @keyframes detectPulse { 0%{box-shadow:0 0 0 0 rgba(197,130,30,0.5)} 50%{box-shadow:0 0 0 8px rgba(197,130,30,0)} 100%{box-shadow:0 0 0 0 rgba(197,130,30,0)} }
+    .archetype-card { border: 1px solid var(--border); border-radius: 14px; overflow: hidden; margin-bottom: 14px; opacity: 0; transform: translateY(12px); transition: opacity 0.45s ease, transform 0.45s ease; }
+    .archetype-card.detected { opacity: 1; transform: translateY(0); }
+    .archetype-card.pulse { animation: detectPulse 0.6s ease-out; }
+    .archetype-header { padding: 20px 24px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .archetype-name { font-family: 'Playfair Display', serif; font-size: 20px; font-weight: 700; color: white; margin-bottom: 4px; }
+    .archetype-one-liner { font-size: 13px; color: rgba(255,255,255,0.8); }
+    .archetype-detected { font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; background: rgba(0,0,0,0.25); color: rgba(255,255,255,0.9); border-radius: 4px; padding: 3px 8px; flex-shrink: 0; position: relative; overflow: hidden; }
+    @keyframes scanLine { 0%{left:-100%} 100%{left:200%} }
+    .archetype-detected::after { content:''; position: absolute; top: 0; left: -100%; width: 60%; height: 100%; background: linear-gradient(90deg,transparent,rgba(255,255,255,0.4),transparent); animation: scanLine 0.8s ease-out forwards; }
+    .archetype-body { padding: 0 24px; }
+    .threat-section { padding: 16px 0; border-top: 1px solid var(--border); }
+    .threat-label { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted-3); margin-bottom: 6px; }
+    .threat-text { font-size: 13px; color: var(--muted-1); line-height: 1.65; }
+    .move-card { background: var(--ink); border-radius: 10px; padding: 18px 20px; margin: 12px 0 20px; }
+    .move-label { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); margin-bottom: 8px; }
+    .move-text { font-size: 13px; color: #E2E8F0; line-height: 1.7; }
+    .move-steps { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+    .move-step { font-size: 12px; color: #CBD5E1; padding: 8px 12px; background: rgba(255,255,255,0.05); border-radius: 6px; border-left: 2px solid var(--gold); line-height: 1.5; }
+    .trigger-caption { font-size: 11px; color: var(--muted-3); padding: 8px 24px 16px; }
+    .clean-read-banner { background: var(--green-bg); border: 1px solid var(--green-border); border-radius: 12px; padding: 24px; margin-bottom: 16px; }
+    .clean-read-title { font-family: 'Playfair Display', serif; font-size: 18px; font-weight: 700; color: var(--green-band); margin-bottom: 8px; }
+    .clean-read-body { font-size: 13px; color: #14532D; line-height: 1.65; margin-bottom: 12px; }
+    .clean-disciplines { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+    .clean-discipline { font-size: 12px; color: #14532D; padding: 8px 12px; background: white; border-radius: 6px; border-left: 2px solid var(--teal); line-height: 1.5; }
+    .context-recap { background: var(--bone); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; }
+    .recap-pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .recap-pill { font-size: 12px; font-weight: 600; color: var(--muted-1); background: white; border: 1px solid var(--border); border-radius: 20px; padding: 4px 12px; }
+    .recap-note { font-size: 13px; color: var(--muted-2); font-style: italic; line-height: 1.55; }
+    .result-footer { text-align: center; padding: 12px 0 48px; }
+    .sample-ribbon { background: var(--ink); color: white; text-align: center; padding: 10px 20px; font-size: 12px; font-weight: 500; }
+    .sample-ribbon strong { color: var(--gold); }
+    .share-toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--ink); color: white; font-size: 13px; font-weight: 600; padding: 12px 24px; border-radius: 40px; opacity: 0; transition: opacity 0.2s, transform 0.2s; pointer-events: none; white-space: nowrap; z-index: 999; }
+    .share-toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .delta-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 700; padding: 4px 12px; border-radius: 20px; margin-left: 10px; vertical-align: middle; }
+    .delta-badge.up { background: #FEF2F2; color: #991B1B; border: 1px solid #FECACA; }
+    .delta-badge.down { background: #F0FDF4; color: #166534; border: 1px solid #BBF7D0; }
+    .delta-badge.same { background: var(--bone); color: var(--muted-2); border: 1px solid var(--border); }
+    .site-footer { border-top: 1px solid var(--border); padding: 24px 20px; text-align: center; font-size: 11px; color: var(--muted-3); letter-spacing: 0.04em; margin-top: 40px; }
+    .site-footer-lockup { display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 8px; }
+    .site-footer-logo { width: 18px; height: 18px; border-radius: 4px; object-fit: cover; }
+    .has-tip { position: relative; cursor: help; }
+    .tip-icon { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 50%; background: rgba(0,0,0,0.08); color: var(--muted-2); font-size: 10px; font-weight: 700; font-style: normal; margin-left: 5px; vertical-align: middle; cursor: help; flex-shrink: 0; }
+    .tip-icon:hover { background: var(--gold); color: white; }
+    .tip-bubble { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%) translateY(4px); background: var(--ink); color: #E2E8F0; font-size: 12px; font-weight: 400; line-height: 1.55; padding: 12px 14px; border-radius: 10px; width: 260px; text-align: left; text-transform: none; letter-spacing: normal; opacity: 0; pointer-events: none; transition: opacity 0.15s ease, transform 0.15s ease; z-index: 50; box-shadow: 0 8px 24px rgba(0,0,0,0.25); }
+    .tip-bubble::after { content:''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: var(--ink); }
+    .has-tip:hover .tip-bubble, .tip-icon:hover .tip-bubble { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+    .tip-bubble strong { color: white; }
+    @media (max-width: 480px) { .tip-bubble { width: 220px; left: 0; transform: translateX(0) translateY(4px); } .has-tip:hover .tip-bubble, .tip-icon:hover .tip-bubble { transform: translateX(0) translateY(0); } .tip-bubble::after { left: 20px; } }
+
+    /* ═══ CONTINGENCY BRIEFING STYLES ═══ */
+    .contingency-banner { background: var(--ink); border-radius: 16px; padding: 28px 32px; margin-bottom: 20px; border: 2px solid var(--gold); }
+    .contingency-banner-inner { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+    .contingency-eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+    .contingency-title { font-family: 'Playfair Display', serif; font-size: 20px; font-weight: 700; color: white; margin-bottom: 6px; }
+    .contingency-desc { font-size: 13px; color: #94A3B8; line-height: 1.55; max-width: 480px; }
+    .btn-contingency { background: var(--gold); color: white; border: none; border-radius: 8px; padding: 12px 22px; font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s; white-space: nowrap; flex-shrink: 0; align-self: center; }
+    .btn-contingency:hover { background: var(--gold-dim); }
+    .cont-ctx-recap { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; }
+    .cont-ctx-recap-title { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted-3); margin-bottom: 10px; }
+    .cont-ctx-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+    .cont-ctx-pill { font-size: 12px; font-weight: 600; color: #CBD5E1; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; padding: 4px 12px; }
+    .cont-action-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 24px; }
+    .layer-card { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; margin-bottom: 16px; overflow: hidden; }
+    .layer-header { display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid rgba(255,255,255,0.06); flex-wrap: wrap; }
+    .layer-number { font-size: 11px; font-weight: 700; color: var(--gold); letter-spacing: 0.06em; text-transform: uppercase; min-width: 60px; }
+    .layer-title { font-size: 14px; font-weight: 700; color: white; }
+    .layer-desc { font-size: 12px; color: #64748B; margin-left: auto; }
+    .layer-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+    .layer-item { padding: 12px 14px; background: rgba(255,255,255,0.03); border-radius: 8px; border-left: 2px solid var(--gold); }
+    .layer-item-q { font-size: 13px; color: #E2E8F0; margin-bottom: 5px; font-weight: 600; line-height: 1.4; }
+    .layer-item-why { font-size: 12px; color: #64748B; margin-bottom: 4px; font-style: italic; }
+    .layer-item-angle { font-size: 12px; color: #94A3B8; }
+    .conf-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; float: right; margin-left: 8px; margin-bottom: 4px; }
+    .conf-badge.high { background: rgba(29,158,117,0.2); color: #6EE7B7; border: 1px solid rgba(29,158,117,0.3); }
+    .conf-badge.medium { background: rgba(197,130,30,0.2); color: #FDE68A; border: 1px solid rgba(197,130,30,0.3); }
+    .wildcard-cat { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--gold); margin-bottom: 4px; }
+    .wildcard-ex { font-size: 13px; color: #E2E8F0; margin-bottom: 4px; font-style: italic; }
+    .wildcard-fw { font-size: 12px; color: #64748B; }
+    .bridge-move { padding: 12px 14px; background: rgba(255,255,255,0.03); border-radius: 8px; border-left: 2px solid var(--purple); }
+    .bridge-move-label { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--purple); margin-bottom: 5px; }
+    .bridge-move-line { font-size: 13px; color: #E2E8F0; font-weight: 600; margin-bottom: 4px; line-height: 1.4; }
+    .bridge-move-when { font-size: 12px; color: #64748B; font-style: italic; }
+    .gen-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 24px; gap: 16px; }
+    .gen-spinner { width: 40px; height: 40px; border: 3px solid rgba(197,130,30,0.3); border-top-color: var(--gold); border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .gen-label { font-size: 15px; font-weight: 600; color: white; }
+    .gen-sub { font-size: 13px; color: #64748B; text-align: center; max-width: 320px; line-height: 1.5; }
+    .cont-regen-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="top-bar">
+        <div class="top-bar-inner">
+            <div class="brand-lockup">
+                <span class="brand-name">Discovery Gap Profiler&#8482;</span>
+                <span class="brand-sub">The Sales Athlete System&#8482; &middot; Netoria, Inc.</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:14px;">
+                <div class="tme-lockup">
+                    <img class="tme-logo" id="tme-logo-top" alt="The Mentored Edge" src="">
+                    <span class="netoria-badge">The Mentored Edge</span>
+                </div>
+                <button class="btn-download" onclick="downloadApp()">
+                    <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1v7.5M6.5 8.5L4 6M6.5 8.5L9 6M1.5 10.5h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Save to device
+                </button>
+            </div>
+        </div>
+    </div>
+    <div id="sample-ribbon" style="display:none">
+        <div class="sample-ribbon">
+            <strong>Sample read</strong> &mdash; Alex Rivera &middot; $180K &middot; Discovery Stage &middot; Manufacturing &middot; "I feel good about this deal but I built the pain narrative from their job postings"
+        </div>
+    </div>
+    <div class="app" id="app-root">
+        <div class="phase-bar">
+            <div class="phase-step active"><div class="phase-dot"></div>Overview</div>
+            <div class="phase-line"></div>
+            <div class="phase-step"><div class="phase-dot"></div>Deal Context</div>
+            <div class="phase-line"></div>
+            <div class="phase-step"><div class="phase-dot"></div>15 Questions</div>
+            <div class="phase-line"></div>
+            <div class="phase-step"><div class="phase-dot"></div>Discovery Read</div>
+            <div class="phase-line"></div>
+            <div class="phase-step"><div class="phase-dot"></div>Contingency Brief</div>
+        </div>
+        <div class="card">
+            <div class="intro-eyebrow">Pre-Proposal Intelligence &middot; Rep Diagnostic</div>
+            <h1 class="intro-headline spp-heading">What do you not know<br>about this deal <em>right now</em>?</h1>
+            <p class="intro-body">Most failed proposals weren&rsquo;t failed pitches &mdash; they were built on discovery that was never actually confirmed. The Discovery Gap Profiler runs 15 questions across five dimensions of what a rep should know before building anything further, and returns a complete, evidence-based read on exactly where assumption has replaced verified fact &mdash; before that gap shows up in a lost deal.</p>
+            <div class="value-props">
+                <div class="value-prop"><div class="value-prop-label">5 Dimensions &middot; 15 Questions</div><div class="value-prop-text">Pain Verification, Decision Criteria, Buying Process, Success Definition, and Political Mapping. Built to expose assumption, not just confirm it.</div></div>
+                <div class="value-prop"><div class="value-prop-label">5 Named Archetypes</div><div class="value-prop-text">The Template Pitch, The Assumed Ally, The Process Blind Spot, The Surface Scan, The Political Blindfold. Each with a full threat profile and specific next moves.</div></div>
+                <div class="value-prop"><div class="value-prop-label">Discovery Action Card</div><div class="value-prop-text">A clear recommendation &mdash; proceed, confirm gaps, return to discovery, or restart &mdash; plus the exact questions to ask before the next step.</div></div>
+            </div>
+            <div class="cta-row">
+                <button class="btn-primary" id="btn-start">Profile a deal&rsquo;s discovery &rarr;</button>
+                <button class="btn-ghost" id="btn-sample">See a sample read</button>
+            </div>
+        </div>
+    </div>
+    <footer class="site-footer">
+        <div class="site-footer-lockup">
+            <img class="site-footer-logo" id="tme-logo-footer" alt="The Mentored Edge" src="">
+        </div>
+        The Sales Athlete System&#8482; &middot; A Netoria, Inc. product &middot; Delivered through The Mentored Edge
+    </footer>
+    <div class="share-toast" id="share-toast"></div>
+    <script>
+    const TME_LOGO_DATA = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIHJ4PSIyMCIgZmlsbD0iIzE0MUIyRCIvPjx0ZXh0IHg9IjUwIiB5PSI2OCIgZm9udC1mYW1pbHk9Ikdlb3JnaWEsc2VyaWYiIGZvbnQtc2l6ZT0iMzgiIGZvbnQtd2VpZ2h0PSJib2xkIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjQzU4MjFFIj5UTUU8L3RleHQ+PC9zdmc+";
+    document.addEventListener('DOMContentLoaded', function() {
+        const t1 = document.getElementById('tme-logo-top');
+        const t2 = document.getElementById('tme-logo-footer');
+        if (t1) t1.src = TME_LOGO_DATA;
+        if (t2) t2.src = TME_LOGO_DATA;
+    });
+
+    const DIMENSIONS = [
+        { id: 'pain-verification', label: 'Pain Verification', short: 'D1', qs: [1,2,3], context: 'A pain that sounds real and a pain that has been confirmed by the buyer are two different things. These three questions test whether the rep has verified the problem or inferred it.' },
+        { id: 'decision-criteria', label: 'Decision Criteria Clarity', short: 'D2', qs: [4,5,6], context: 'Most reps assume they know how a buyer will choose. These questions expose whether the evaluation criteria have actually been confirmed or are being guessed from past deals.' },
+        { id: 'buying-process', label: 'Buying Process Visibility', short: 'D3', qs: [7,8,9], context: 'Every organization has its own approval path. These questions test whether the rep understands this specific process or is assuming a generic one.' },
+        { id: 'success-definition', label: 'Success Definition', short: 'D4', qs: [10,11,12], context: 'Winning the deal and the buyer feeling like they won are not always the same outcome. These questions test whether success has actually been defined in measurable terms.' },
+        { id: 'political-mapping', label: 'Political Mapping', short: 'D5', qs: [13,14,15], context: 'The hardest and most consequential part of discovery. These questions test whether the rep has mapped who actually matters in this decision \u2014 and the internal dynamics between them \u2014 not just whether their champion is strong.' },
+    ];
+
+    const QUESTIONS = [
+        { n:1, dim:'pain-verification', title:"How was the core business pain in this deal actually identified?", probe:"Did the buyer tell you this unprompted, or did you propose it and they agreed?", options:[{letter:'A',pts:1,text:"Buyer-articulated and quantified \u2014 buyer described the problem unprompted and put a number or consequence on it"},{letter:'B',pts:2,text:"Buyer-confirmed when asked \u2014 buyer agreed when the rep proposed the problem, but didn't originate it themselves"},{letter:'C',pts:3,text:"Rep-inferred from context \u2014 rep built the pain narrative from indirect signals (job postings, news, industry trends) without direct confirmation"},{letter:'D',pts:4,text:"Assumed from template \u2014 rep is using a standard pain narrative for this persona or industry without testing it against this specific buyer"}]},
+        { n:2, dim:'pain-verification', title:"What evidence exists that this pain is costing the buyer something measurable today?", probe:"Not whether it sounds expensive. Whether a number has actually been attached to it by someone on their side.", options:[{letter:'A',pts:1,text:"Quantified and buyer-sourced \u2014 buyer has given a specific number (dollars, hours, churn rate) tied to the problem"},{letter:'B',pts:2,text:"Quantified but rep-estimated \u2014 rep has built a credible estimate the buyer hasn't explicitly confirmed or denied"},{letter:'C',pts:3,text:"Described qualitatively only \u2014 buyer acknowledges the problem matters but no one has attached a number to it"},{letter:'D',pts:4,text:"Unconfirmed \u2014 no one has verified this pain has a measurable cost; it's assumed to matter because it sounds like it should"}]},
+        { n:3, dim:'pain-verification', title:"Has the rep confirmed this pain is a current priority \u2014 not just a real but low-priority problem?", probe:"A real problem and an urgent problem are not the same thing. Which one is this?", options:[{letter:'A',pts:1,text:"Confirmed active priority \u2014 buyer has stated this is being actively worked on or budgeted for now, not someday"},{letter:'B',pts:2,text:"Implied priority \u2014 buyer's urgency language and engagement pattern suggest priority, not explicitly confirmed"},{letter:'C',pts:3,text:"Unclear priority \u2014 pain is real but the rep doesn't know if it's this quarter's priority or next year's"},{letter:'D',pts:4,text:"Possibly not a priority \u2014 rep has not tested priority directly and is hoping engagement level means urgency"}]},
+        { n:4, dim:'decision-criteria', title:"Does the rep know the specific criteria this buyer will use to evaluate solutions?", probe:"Documented and weighted, or assumed from how the last deal like this one went?", options:[{letter:'A',pts:1,text:"Documented and weighted \u2014 buyer has shared explicit evaluation criteria, ideally with relative importance or weighting"},{letter:'B',pts:2,text:"Verbally described \u2014 buyer has talked through what matters to them but nothing is documented or weighted"},{letter:'C',pts:3,text:"Rep-assumed from similar deals \u2014 rep is applying criteria that worked in comparable past deals without confirming with this buyer"},{letter:'D',pts:4,text:"Unknown \u2014 rep has not had a direct conversation about how this decision will actually be evaluated"}]},
+        { n:5, dim:'decision-criteria', title:"Has the rep confirmed who defines \u201cbest fit\u201d in this decision \u2014 and on what basis?", probe:"Confirmed directly with that person, or assumed based on their job title?", options:[{letter:'A',pts:1,text:"Confirmed with the actual evaluator \u2014 rep has spoken directly with whoever owns the evaluation and understands their lens"},{letter:'B',pts:2,text:"Confirmed through champion \u2014 champion has described the evaluator's perspective secondhand"},{letter:'C',pts:3,text:"Assumed based on title \u2014 rep is guessing evaluation philosophy based on the evaluator's role, not a real conversation"},{letter:'D',pts:4,text:"Unknown \u2014 rep doesn't know who actually defines fit or what their decision lens looks like"}]},
+        { n:6, dim:'decision-criteria', title:"Does the rep understand which criteria are dealbreakers versus nice-to-haves?", probe:"Has this been explicitly prioritized, or is everything being treated as equally important?", options:[{letter:'A',pts:1,text:"Fully prioritized \u2014 buyer has explicitly separated must-haves from preferences"},{letter:'B',pts:2,text:"Mostly clear \u2014 rep has a reasonable read on priority order based on direct conversation, not fully confirmed"},{letter:'C',pts:3,text:"Guessing at priority \u2014 rep has a list of criteria but no real sense of which ones are negotiable"},{letter:'D',pts:4,text:"No prioritization \u2014 every criterion is being treated as equally important because none has been tested"}]},
+        { n:7, dim:'buying-process', title:"Has the rep confirmed the actual approval steps this deal will go through, in order?", probe:"Walked through by the buyer specifically, or assumed from a typical enterprise process?", options:[{letter:'A',pts:1,text:"Fully mapped and confirmed \u2014 buyer has walked the rep through the specific sequence of approvals for a deal like this"},{letter:'B',pts:2,text:"Generally understood \u2014 rep has a reasonable picture of the process from partial information, not a complete walkthrough"},{letter:'C',pts:3,text:"Assumed from typical process \u2014 rep is applying a generic enterprise buying process template to this specific deal"},{letter:'D',pts:4,text:"Unknown \u2014 rep has not asked how this organization actually approves a purchase like this"}]},
+        { n:8, dim:'buying-process', title:"Does the rep know if this type of purchase has been made before at this organization?", probe:"Confirmed precedent, or an assumption that this is uncharted territory for them?", options:[{letter:'A',pts:1,text:"Confirmed precedent \u2014 rep knows of a specific past purchase of similar scope and has learned from how that process went"},{letter:'B',pts:2,text:"Believed precedent exists \u2014 buyer has mentioned something similar happened before but details are vague"},{letter:'C',pts:3,text:"Unknown precedent \u2014 rep has not asked whether this organization has bought something like this before"},{letter:'D',pts:4,text:"Assumed no precedent \u2014 rep is assuming this is a novel purchase without confirming, which usually means the process is being underestimated"}]},
+        { n:9, dim:'buying-process', title:"Has the rep identified what could stall or restart this process internally?", probe:"Budget cycles, reorgs, competing initiatives \u2014 has any of this actually been asked about?", options:[{letter:'A',pts:1,text:"Known and planned for \u2014 rep has identified specific risks (budget cycle, reorg, competing initiative) and has a plan to navigate them"},{letter:'B',pts:2,text:"Partially known \u2014 rep is aware of one or two risk factors but hasn't fully mapped how they could affect timing"},{letter:'C',pts:3,text:"Unexamined \u2014 rep hasn't asked what has stalled similar initiatives at this organization before"},{letter:'D',pts:4,text:"No visibility \u2014 rep has no information about what internal dynamics could delay or kill this process"}]},
+        { n:10, dim:'success-definition', title:"Has the buyer defined what success looks like in concrete, measurable terms?", probe:"A specific metric, or something closer to \u201cmake things better\u201d?", options:[{letter:'A',pts:1,text:"Specific and measurable \u2014 buyer has stated a clear metric or outcome that defines success (e.g. reduce X by 20% in 6 months)"},{letter:'B',pts:2,text:"Directionally clear \u2014 buyer has described the kind of outcome they want without precise measurement"},{letter:'C',pts:3,text:"Vague or aspirational \u2014 buyer talks about success in general terms without anything testable"},{letter:'D',pts:4,text:"Undefined \u2014 no one has actually asked the buyer what success looks like; the rep is assuming alignment"}]},
+        { n:11, dim:'success-definition', title:"Does the rep know how the buyer will measure ROI or justify this purchase internally?", probe:"A confirmed justification model, or an assumed standard ROI narrative?", options:[{letter:'A',pts:1,text:"Confirmed justification model \u2014 rep knows specifically how the buyer will build the internal business case and defend the spend"},{letter:'B',pts:2,text:"General sense \u2014 rep has a rough idea of the justification logic without specifics"},{letter:'C',pts:3,text:"Assumed \u2014 rep is assuming a standard ROI narrative applies without testing it with this buyer"},{letter:'D',pts:4,text:"Unknown \u2014 rep has no idea how this purchase will be justified internally beyond the buyer liking the product"}]},
+        { n:12, dim:'success-definition', title:"Has the rep confirmed what would make this buyer consider the deal a failure even after signing?", probe:"This question alone separates reps who think past the signature from those who don't.", options:[{letter:'A',pts:1,text:"Explicitly discussed \u2014 rep has had a direct conversation about what failure or disappointment would look like post-purchase"},{letter:'B',pts:2,text:"Partially understood \u2014 rep has some sense of risk areas from context, not a direct conversation"},{letter:'C',pts:3,text:"Not discussed \u2014 rep has not raised this question at all"},{letter:'D',pts:4,text:"No idea \u2014 rep has given no thought to what could make this a perceived failure even after the deal closes"}]},
+        { n:13, dim:'political-mapping', title:"Has the rep identified everyone whose support or opposition could affect this deal?", probe:"Not just approvers. Influencers and potential blockers outside the direct chain too.", options:[{letter:'A',pts:1,text:"Fully mapped \u2014 rep has identified supporters, neutral parties, and likely skeptics by name, including people outside the direct approval chain"},{letter:'B',pts:2,text:"Mostly mapped \u2014 rep knows the main players but likely has not identified quieter influencers or potential skeptics"},{letter:'C',pts:3,text:"Partially mapped \u2014 rep knows the people they've directly talked to but hasn't asked who else has a stake in this decision"},{letter:'D',pts:4,text:"Unmapped \u2014 rep only knows the champion and possibly one approver; the broader political landscape is unknown"}]},
+        { n:14, dim:'political-mapping', title:"Does the rep understand the internal rivalries, competing priorities, or turf dynamics that could affect this deal?", probe:"Has this been confirmed, or has the rep been told \u201cthere's no politics here\u201d and taken it at face value?", options:[{letter:'A',pts:1,text:"Clearly understood \u2014 rep knows of specific internal tensions (budget competition, departmental rivalry, prior bad vendor experience) that could help or hurt this deal"},{letter:'B',pts:2,text:"Partially understood \u2014 rep has picked up on some internal dynamics through conversation but hasn't directly confirmed them"},{letter:'C',pts:3,text:"Unexamined \u2014 rep hasn't asked about internal politics at all and is assuming this is a purely rational, consensus-driven decision"},{letter:'D',pts:4,text:"Actively naive \u2014 rep has been told there's \u201cno politics here\u201d and has taken that claim at face value without testing it"}]},
+        { n:15, dim:'political-mapping', title:"Has the rep identified who wins and who loses internally if this deal happens \u2014 and adjusted their strategy accordingly?", probe:"Every real organizational decision creates winners and losers. Has this rep thought about who's who?", options:[{letter:'A',pts:1,text:"Fully identified and planned for \u2014 rep knows who benefits, who might feel threatened, and has a specific plan to manage likely resistance"},{letter:'B',pts:2,text:"Partially identified \u2014 rep has a guess about winners and losers but hasn't built it into their deal strategy"},{letter:'C',pts:3,text:"Not considered \u2014 rep has not thought about this deal in terms of internal winners and losers"},{letter:'D',pts:4,text:"No awareness \u2014 rep is treating this as a purely logical decision with no internal politics, which is rarely true in real organizations"}]},
+    ];
+
+    const DIM_Q_LABELS = {
+        1:'Pain origin', 2:'Quantified cost', 3:'Priority confirmation',
+        4:'Evaluation criteria', 5:'Decision-maker lens', 6:'Dealbreaker clarity',
+        7:'Approval steps mapped', 8:'Purchase precedent', 9:'Process risk factors',
+        10:'Success definition', 11:'ROI justification model', 12:'Post-sale failure definition',
+        13:'Stakeholder mapping', 14:'Internal dynamics', 15:'Winners and losers'
+    };
+
+    const ARCHETYPES = {
+        'template-pitch': { name:'The Template Pitch', color:'#C5821E', oneLiner:'Running a playbook. Not running this deal.', threat:"The pain narrative, the evaluation criteria, and the buying process assumptions in this deal all trace back to a template \u2014 not to anything actually confirmed with this specific buyer. This is the most common failure mode in discovery, and the most dangerous because it doesn\u2019t feel like a failure. The rep has a confident, well-rehearsed story. The problem is that the story was built for a persona, not for this person. A template can be directionally right and still miss the specific thing that would have made this buyer say yes \u2014 or the specific thing that quietly makes them say no.", move:"Before building anything further \u2014 a proposal, a business case, an executive presentation \u2014 go back and pressure-test the three assumed elements directly with the buyer. Ask: \u201cI want to make sure I\u2019m solving the right problem for you specifically \u2014 not a generic version of it. Can you walk me through, in your own words, what\u2019s actually costing you the most right now?\u201d Then listen for whether the answer matches the template or diverges from it. Divergence is the signal that real discovery hasn\u2019t happened yet.", steps:['Re-run the pain conversation with a buyer-led, not rep-led, framing \u2014 ask open questions and resist the urge to confirm your own narrative','Get the evaluation criteria in writing from the buyer directly, even informally in an email recap, rather than relying on inference','Ask explicitly how this organization\u2019s buying process differs from what the rep assumes a typical process looks like'], trigger:'Q1 = D and Q4 \u2208 {C,D} and Q7 \u2208 {C,D}', triggerPlain:'The pain was assumed from a template, the evaluation criteria were assumed from past deals, and the buying process was assumed to be generic \u2014 three independent signals this deal is being run on a playbook rather than confirmed specifics.' },
+        'assumed-ally': { name:'The Assumed Ally', color:'#7C5DE0', oneLiner:'The relationship feels aligned. Alignment was never confirmed.', threat:"The rep believes there is shared understanding with the buyer about what success looks like and how this purchase gets justified internally \u2014 but none of it has actually been tested in a direct conversation. This is a particularly seductive trap because it often comes from a genuinely warm relationship: the buyer is friendly, responsive, and seems engaged, so the rep extrapolates agreement that was never explicitly stated. The risk surfaces late \u2014 usually when the buyer\u2019s internal stakeholders ask a justification question the rep assumed was already answered.", move:"Have a direct conversation that tests alignment rather than assumes it. Ask the buyer: \u201cIf this purchase goes through, how will you know six months from now that it was the right call? What would you point to?\u201d Their answer \u2014 or their inability to give a specific one \u2014 tells the rep immediately whether the alignment they\u2019ve been assuming is real or imagined.", steps:['Schedule a specific conversation focused only on defining success in measurable terms \u2014 don\u2019t let it ride alongside a product demo','Ask the buyer directly how they expect to justify this purchase internally, and request to see or help build that justification','Confirm who actually defines \u201cbest fit\u201d in this decision rather than continuing to rely on the champion\u2019s interpretation'], trigger:'Q5 \u2208 {C,D} and Q10 \u2208 {C,D} and Q11 \u2208 {C,D}', triggerPlain:'The decision-maker\u2019s evaluation lens is assumed rather than confirmed, success has not been defined in measurable terms, and the ROI justification model is unknown \u2014 three signals the rep is assuming alignment that has never actually been tested.' },
+        'process-blind-spot': { name:'The Process Blind Spot', color:'#D14545', oneLiner:'No visibility into how this organization actually decides.', threat:"The rep has no real understanding of the approval sequence this deal will go through, whether anything comparable has been purchased before, or what internal dynamics could stall or kill the process. This is the profile most likely to produce a deal that goes dark without warning \u2014 not because the buyer lost interest, but because the rep never understood the actual mechanics of how a decision like this gets made at this specific organization. A deal can have a great champion and real pain and still die quietly in a process the rep never mapped.", move:"Ask the champion directly: \u201cWalk me through, step by step, what happens between now and a signed contract. Who has to say yes, in what order, and what could each one of them say no to?\u201d If the champion cannot answer this in detail, that is itself diagnostic \u2014 it means either the champion doesn\u2019t know either, or the rep hasn\u2019t asked clearly enough. Either way, the process needs to be mapped before the next step is built.", steps:['Request a specific walkthrough of the approval sequence from the champion, including names and roles at each stage','Ask whether the organization has purchased something comparable before, and if so, what made that process slow or fast','Identify the budget cycle, planning calendar, or other internal rhythms that could affect timing independent of the rep\u2019s own urgency'], trigger:'Q7 = D and Q8 \u2208 {C,D} and Q9 \u2208 {C,D}', triggerPlain:'The approval steps are completely unknown, there\u2019s no visibility into whether this purchase has precedent, and no risk factors that could stall the process have been identified \u2014 three independent signals of zero process visibility.' },
+        'surface-scan': { name:'The Surface Scan', color:'#5B8FB9', oneLiner:'A real problem, identified but never pressure-tested.', threat:"The rep found a plausible, real problem \u2014 but stopped there. The cost of the problem hasn\u2019t been quantified, its priority hasn\u2019t been confirmed, and no one has asked what would make this purchase feel like a failure even after it closes. This is shallow discovery, not bad discovery: the rep did real work, but didn\u2019t go deep enough to know if this is a top-of-mind priority or a someday problem, and hasn\u2019t thought past the signature to what actually needs to happen for the buyer to feel like they won.", move:"Go back to the buyer with two specific questions they likely haven\u2019t been asked yet: \u201cWhat\u2019s this problem actually costing you \u2014 in dollars, hours, or risk \u2014 today?\u201d and \u201cIf we sign this and six months from now you\u2019re disappointed, what would have happened?\u201d The first question tests whether the pain is real or assumed. The second tests whether the rep understands what winning actually looks like, not just what closing looks like.", steps:['Quantify the cost of the problem directly with the buyer rather than relying on a rep-built estimate','Explicitly confirm whether this is an active, budgeted priority or a real-but-not-urgent problem','Ask the post-sale failure question before building the proposal, not after the deal closes'], trigger:'Q2 \u2208 {C,D} and Q3 \u2208 {C,D} and Q12 \u2208 {C,D}', triggerPlain:'The cost of the pain hasn\u2019t been quantified, priority hasn\u2019t been confirmed, and the definition of post-sale failure hasn\u2019t been discussed \u2014 three signals that discovery touched the surface but didn\u2019t go deep enough.' },
+        'political-blindfold': { name:'The Political Blindfold', color:'#1D9E75', oneLiner:'No map of who else has a stake in this decision.', threat:"The rep has built a deal strategy as if this organization makes decisions in a political vacuum. They know their champion and maybe one approver \u2014 but have no map of who else has a stake, no awareness of internal rivalries or turf dynamics, and no plan for who might feel threatened if this deal goes through. This is the blind spot that kills deals that look perfectly healthy right up until a stakeholder the rep never identified quietly kills it in a room the rep was never in. It is the hardest part of discovery to do well, and the most consequential to skip.", move:"Ask the champion a question most reps never ask: \u201cIs there anyone in the organization who might see this differently than you do \u2014 someone who might feel this reflects on a project they already tried, or who might lose something if this moves forward?\u201d A good champion will know the answer. A champion who is surprised by the question is a signal the rep needs to widen the conversation beyond this one relationship immediately.", steps:['Explicitly ask the champion to name anyone outside the immediate buying group who could influence or block this decision','Ask directly about internal rivalries, competing budget priorities, or past vendor experiences that could be working for or against this deal','Build a one-page stakeholder map identifying likely supporters, neutral parties, and possible skeptics before the next major deal step'], trigger:'Q13 = D and Q14 \u2208 {C,D} and Q15 \u2208 {C,D}', triggerPlain:'The stakeholder map is essentially empty, internal dynamics have not been examined, and the rep has given no thought to who wins or loses internally \u2014 three signals of a deal being run with no political awareness at all.' },
+    };
+
+    const BAND_COPY = {
+        green: { band:'Discovery Solid', headline:'This discovery is built on confirmed fact, not assumption.', body:'Across all five dimensions, the rep has tested and confirmed what matters \u2014 the pain, the criteria, the process, the definition of success, and the political landscape. This is the foundation a real proposal should be built on. Proceed with confidence, and keep validating as new stakeholders enter the deal.' },
+        gold: { band:'Discovery Gaps', headline:'Real progress, with specific gaps that need to close before you build the next step.', body:'The rep has confirmed some of what matters but is operating on assumption in at least one critical dimension. Building a proposal or executive presentation on top of these gaps risks a strategy that doesn\u2019t actually land with the buyer. The debrief below identifies exactly what to confirm next.' },
+        red: { band:'Discovery Blind', headline:'This deal is being run on assumption, not confirmed discovery.', body:'The pattern across multiple dimensions shows a rep who has not done the verification work this deal needs before moving forward. This is not a judgment of effort \u2014 it\u2019s a signal that the next step should be more discovery, not a proposal. Acting on this now risks building something that misses what the buyer actually needs.' }
+    };
+
+    const DEAL_SIZES = ['Under $25K','$25K\u2013$100K','$100K\u2013$250K','$250K\u2013$1M','$1M+'];
+    const STAGES = ['Early Pipeline','Discovery','Qualification','Proposal Prep'];
+    const INDUSTRIES = ['SaaS / Software','Financial Services','Healthcare','Manufacturing','Professional Services','Retail / CPG','Government / Public Sector','Other'];
+
+    const SAMPLE_CTX = { repName:'Alex Rivera', dealSize:'$100K\u2013$250K', stage:'Discovery', industry:'Manufacturing', note:"I feel good about this deal but I built the pain narrative from their job postings, haven't actually validated it with anyone there" };
+    const SAMPLE_ANS = [
+        {questionN:1,letter:'D',source:'observed'},{questionN:2,letter:'B',source:'told'},{questionN:3,letter:'C',source:'assumed'},
+        {questionN:4,letter:'C',source:'assumed'},{questionN:5,letter:'B',source:'told'},{questionN:6,letter:'B',source:'told'},
+        {questionN:7,letter:'C',source:'assumed'},{questionN:8,letter:'C',source:'assumed'},{questionN:9,letter:'B',source:'told'},
+        {questionN:10,letter:'B',source:'told'},{questionN:11,letter:'C',source:'assumed'},{questionN:12,letter:'C',source:'assumed'},
+        {questionN:13,letter:'D',source:'assumed'},{questionN:14,letter:'C',source:'assumed'},{questionN:15,letter:'C',source:'assumed'}
+    ];
+
+    function scoreRun(answers) {
+        if (answers.length !== 15) throw new Error('Need 15');
+        const ns = answers.map(a => a.questionN).sort((a,b) => a-b);
+        for (let i=0; i<15; i++) if (ns[i] !== i+1) throw new Error('Bad questions');
+        const lm = {A:1,B:2,C:3,D:4};
+        const sorted = [...answers].sort((a,b) => a.questionN - b.questionN);
+        const radar = sorted.map(a => lm[a.letter]);
+        const total = radar.reduce((s,v) => s+v, 0);
+        const band = total >= 43 ? 'red' : total >= 28 ? 'gold' : 'green';
+        const byQ = {};
+        sorted.forEach(a => { byQ[a.questionN] = a; });
+        const q = n => byQ[n].letter;
+        const triggered = [];
+        if (q(1)==='D' && ['C','D'].includes(q(4)) && ['C','D'].includes(q(7))) triggered.push('template-pitch');
+        if (['C','D'].includes(q(5)) && ['C','D'].includes(q(10)) && ['C','D'].includes(q(11))) triggered.push('assumed-ally');
+        if (q(7)==='D' && ['C','D'].includes(q(8)) && ['C','D'].includes(q(9))) triggered.push('process-blind-spot');
+        if (['C','D'].includes(q(2)) && ['C','D'].includes(q(3)) && ['C','D'].includes(q(12))) triggered.push('surface-scan');
+        if (q(13)==='D' && ['C','D'].includes(q(14)) && ['C','D'].includes(q(15))) triggered.push('political-blindfold');
+        const high = sorted.filter(a => lm[a.letter] >= 3);
+        const toa = high.filter(a => a.source !== 'observed').length;
+        const dimScores = {};
+        DIMENSIONS.forEach(d => {
+            const pts = d.qs.map(n => lm[q(n)]);
+            dimScores[d.id] = { total: pts.reduce((s,v)=>s+v,0), max: d.qs.length*4, scores: pts };
+        });
+        return { total, displayScore: 75-total, band, radar, triggeredArchetypes: triggered, sourceQuality: { highExposureAnswers: high.length, toldOrAssumed: toa, flagged: toa>=3, highItems: high.map(a=>({q:a.questionN, label:DIM_Q_LABELS[a.questionN], source:a.source})) }, dimScores };
+    }
+
+    function getDiscoveryRec(total) {
+        if (total <= 27) return { label:'Proceed', cls:'proceed', text:'Discovery is solid. Move forward to proposal or next stage.' };
+        if (total <= 35) return { label:'Confirm Gaps First', cls:'confirm', text:'Close the specific gaps identified below before building a proposal or presentation.' };
+        if (total <= 42) return { label:'Return to Discovery', cls:'return', text:'Schedule an additional discovery conversation before any next step. Current understanding has material gaps.' };
+        return { label:'Restart Discovery', cls:'restart', text:'Current understanding is too thin to build on. Treat this as early-stage and restart core discovery.' };
+    }
+
+    function getDimNarrative(dimId, pct) {
+        const N = {
+            'pain-verification':{ low:'The pain is verified, not assumed. The buyer has confirmed both the problem and its cost, and the rep knows this is an active priority rather than a someday concern.', mid:'The pain has partial verification. Either the cost hasn\u2019t been quantified, the priority is unclear, or the problem was rep-proposed rather than buyer-originated. At least one piece needs direct confirmation.', high:'The pain is largely assumed. The rep is likely running a template narrative that has not been tested against this specific buyer\u2019s actual situation, cost, or urgency.' },
+            'decision-criteria':{ low:'The evaluation criteria are well understood. The rep knows what matters to this buyer, who defines fit, and which criteria are non-negotiable.', mid:'The evaluation criteria are partially understood. The rep has a general sense but lacks confirmation on either the specific criteria, who defines fit, or what\u2019s truly a dealbreaker.', high:'The evaluation criteria are largely unknown or assumed. The rep is likely applying logic from past deals rather than this buyer\u2019s actual decision process.' },
+            'buying-process':{ low:'The buying process is mapped and understood. The rep knows the approval sequence, any relevant precedent, and the internal risk factors that could affect timing.', mid:'The buying process has gaps. The rep has a partial picture but is missing either the full approval sequence, knowledge of precedent, or visibility into what could stall things.', high:'The buying process is essentially unknown. The rep is likely assuming a generic process rather than understanding how this specific organization actually decides.' },
+            'success-definition':{ low:'Success has been clearly defined. The buyer has articulated measurable outcomes, the rep understands the ROI justification, and post-sale expectations have been discussed.', mid:'Success is partially defined. The rep has some sense of what the buyer wants but lacks a precise, measurable definition or a clear view of post-sale expectations.', high:'Success is undefined. No one has asked the buyer what winning actually looks like, and the rep has not considered what could make this feel like a failure after signing.' },
+            'political-mapping':{ low:'The political landscape is well mapped. The rep knows who matters beyond the champion, understands internal dynamics, and has a plan for managing likely resistance.', mid:'The political landscape is partially mapped. The rep has some awareness but has not fully identified all stakeholders or confirmed internal dynamics directly.', high:'The political landscape is essentially unmapped. The rep likely knows only the champion and is treating this as a purely rational decision with no internal politics \u2014 which is rarely true.' }
+        };
+        const n = N[dimId]; if (!n) return '';
+        return pct <= 40 ? n.low : pct <= 62 ? n.mid : n.high;
+    }
+
+    function getDealNarrative(result, ctx, answers) {
+        const byQ = {}; answers.forEach(a => { byQ[a.questionN] = a; });
+        const repRef = ctx.repName ? ctx.repName + "'s" : 'This';
+        const rec = getDiscoveryRec(result.total);
+        if (result.band === 'green') return `${repRef} ${ctx.dealSize} deal in ${ctx.industry} scored ${result.displayScore}/60 on the Discovery Gap Profiler \u2014 a ${BAND_COPY.green.band}. The evidence across all five dimensions supports a verified, well-tested discovery process. Pain is confirmed, criteria are clear, the buying process is mapped, success is defined, and the political landscape is understood. Recommendation: ${rec.text} This is the foundation a real proposal should be built on.`;
+        if (result.band === 'gold') { const weakDims = DIMENSIONS.filter(d => (result.dimScores[d.id].total/result.dimScores[d.id].max) > 0.55).map(d => d.label); return `${repRef} ${ctx.dealSize} deal in ${ctx.industry} scored ${result.displayScore}/60 on the Discovery Gap Profiler \u2014 a ${BAND_COPY.gold.band}. Real progress has been made, but the diagnostic has surfaced material gaps in: ${weakDims.length ? weakDims.join(', ') : 'one or more dimensions'}. These are exactly the gaps that produce a proposal or presentation that doesn\u2019t actually land. Recommendation: ${rec.text}`; }
+        const failDims = DIMENSIONS.filter(d => (result.dimScores[d.id].total/result.dimScores[d.id].max) > 0.65).map(d => d.label);
+        return `${repRef} ${ctx.dealSize} deal in ${ctx.industry} scored ${result.displayScore}/60 on the Discovery Gap Profiler \u2014 a ${BAND_COPY.red.band}. The diagnostic has identified significant gaps in: ${failDims.length ? failDims.join(', ') : 'multiple critical dimensions'}. This deal is currently being run on assumption rather than confirmed discovery. Recommendation: ${rec.text}`;
+    }
+
+    function getDebriefQuestions(result, answers) {
+        const byQ = {}; answers.forEach(a => { byQ[a.questionN] = a; });
+        const q = n => byQ[n]?.letter;
+        const qs = [];
+        if (q(1)==='D' || ['C','D'].includes(q(2))) qs.push({ text:"Walk me through exactly how you identified this as the buyer\u2019s core problem. Did they tell you, or did you propose it and they agreed? What\u2019s the actual quantified cost, in their words?", why:"Pain origin and quantified cost are unverified or assumed. A deal built on an unconfirmed pain narrative is built on sand." });
+        if (['C','D'].includes(q(3))) qs.push({ text:"Is this an active, budgeted priority right now \u2014 or a real problem that just isn\u2019t urgent yet? How do you know?", why:"Priority has not been explicitly confirmed. Real pain without urgency rarely produces a closed deal on the expected timeline." });
+        if (['C','D'].includes(q(4)) || ['C','D'].includes(q(5))) qs.push({ text:"What are the specific, weighted criteria this buyer will use to evaluate solutions \u2014 and who actually defines what \u2018best fit\u2019 means here?", why:"Evaluation criteria and the decision-maker\u2019s lens are unconfirmed or assumed from past deals, not this one." });
+        if (['C','D'].includes(q(7))) qs.push({ text:"Walk me through the exact approval sequence this deal will go through \u2014 step by step, who has to say yes, in what order.", why:"The buying process is assumed rather than confirmed. Unmapped approval chains are where deals stall without warning." });
+        if (['C','D'].includes(q(8)) || ['C','D'].includes(q(9))) qs.push({ text:"Has this organization bought something like this before? What slowed that process down, and what could slow this one down the same way?", why:"Purchase precedent and process risk factors are unknown. This is exactly the information that predicts timeline risk." });
+        if (['C','D'].includes(q(10))) qs.push({ text:"What specific, measurable outcome would tell the buyer six months from now that this was the right decision?", why:"Success has not been defined in measurable terms. Without this, the rep is guessing at what \u2018winning\u2019 looks like to the buyer." });
+        if (['C','D'].includes(q(11))) qs.push({ text:"How will the buyer justify this purchase internally \u2014 what\u2019s the actual ROI story they\u2019ll need to tell their own leadership?", why:"The ROI justification model is unconfirmed. The rep needs to know this story to help build it, not assume it." });
+        if (['C','D'].includes(q(12))) qs.push({ text:"If we sign this deal and six months from now the buyer is disappointed, what would have happened? Have you asked them this directly?", why:"Post-sale failure criteria haven\u2019t been discussed. This is the question that prevents a technically-closed deal from becoming a churn risk." });
+        if (q(13)==='D' || ['C','D'].includes(q(14))) qs.push({ text:"Who else in this organization has a stake in this decision that you haven\u2019t directly talked to yet? Are there any internal rivalries or turf dynamics I should know about?", why:"Stakeholder mapping and internal dynamics are largely unexamined. This is the blind spot most likely to kill a healthy-looking deal without warning." });
+        if (['C','D'].includes(q(15))) qs.push({ text:"If this deal happens, who internally benefits the most \u2014 and who might feel threatened or bypassed? What\u2019s your plan for the second group?", why:"Winners and losers haven\u2019t been identified. Every real organizational decision creates both, and ignoring this is a common, avoidable risk." });
+        if (qs.length < 3) { qs.push({ text:"Walk me through everything you know about this deal as if you were briefing someone who\u2019s never heard of it. Where do you find yourself filling in gaps with assumptions?", why:"A structured walkthrough surfaces the gaps the rep has stopped noticing." }); qs.push({ text:"What\u2019s the one question about this deal you\u2019ve been avoiding asking the buyer directly?", why:"Forces the rep to name their own biggest blind spot before it becomes a problem." }); }
+        return qs.slice(0, 6);
+    }
+
+    function getDebriefRisks(result) {
+        return DIMENSIONS.map(d => {
+            const ds = result.dimScores[d.id]; const pct = (ds.total/ds.max)*100;
+            const cls = pct > 65 ? 'high' : pct > 45 ? 'med' : 'low';
+            const labels = { 'pain-verification':{high:'Pain: assumed',med:'Pain: partial',low:'Pain: verified'}, 'decision-criteria':{high:'Criteria: unknown',med:'Criteria: partial',low:'Criteria: confirmed'}, 'buying-process':{high:'Process: unmapped',med:'Process: partial',low:'Process: mapped'}, 'success-definition':{high:'Success: undefined',med:'Success: partial',low:'Success: defined'}, 'political-mapping':{high:'Politics: unmapped',med:'Politics: partial',low:'Politics: mapped'} };
+            return { label: labels[d.id][cls], cls };
+        });
+    }
+
+    function getDebriefActions(result, ctx) {
+        const rec = getDiscoveryRec(result.total);
+        const actions = [{ label:'Discovery action', text: rec.text }];
+        if (result.sourceQuality.flagged) actions.push({ label:'Evidence quality alert', text:`${result.sourceQuality.toldOrAssumed} of ${result.sourceQuality.highExposureAnswers} high-risk signals are secondhand or assumed. The rep\u2019s confidence in this discovery exceeds what\u2019s actually been verified.` });
+        if (result.triggeredArchetypes.length > 0) { const names = result.triggeredArchetypes.map(id => ARCHETYPES[id].name).join(' + '); actions.push({ label:'Archetype alert', text:`Pattern detected: ${names}. Read the full threat profile and manager moves below before the next step on this deal.` }); }
+        if (result.band === 'red' || result.band === 'gold') actions.push({ label:'Required this week', text:'Do not let this deal advance to proposal or presentation without closing the gaps identified above. The coaching questions are the required agenda for the next discovery conversation.' });
+        return actions;
+    }
+
+
+    // ─── STATE & CORE RENDER ──────────────────────────────────────────────────
+    let state = {
+        phase: 'intro', isSample: false,
+        context: { repName: '', dealSize: '$100K–$250K', stage: 'Discovery', industry: 'SaaS / Software', note: '' },
+        answers: Array.from({length:15}, (_,i) => ({questionN:i+1, letter:null, source:'observed'})),
+        currentQ: 0, result: null,
+        contingencyInputs: { execRole: '', initiatives: '' },
+        contingencyResult: null, contingencyLoading: false
+    };
+
+    function setState(p) { state = {...state, ...p}; render(); }
+
+    function render() {
+        const root = document.getElementById('app-root');
+        const ribbon = document.getElementById('sample-ribbon');
+        ribbon.style.display = (state.phase === 'result' && state.isSample) ? 'block' : 'none';
+        let html = '';
+        if (state.phase === 'intro') html = renderIntro();
+        else if (state.phase === 'context') html = renderContext();
+        else if (state.phase === 'quiz') html = renderQuiz();
+        else if (state.phase === 'result') html = renderResult();
+        else if (state.phase === 'contingency') html = renderContingency();
+        root.innerHTML = html;
+        attachHandlers();
+        if (state.phase === 'result') requestAnimationFrame(() => runWowSequence());
+    }
+
+    function phaseBar(active) {
+        const phases = ['intro','context','quiz','result','contingency'];
+        const labels = ['Overview','Deal Context','15 Questions','Discovery Read','Contingency Brief'];
+        const ai = phases.indexOf(active);
+        let h = '<div class="phase-bar">';
+        phases.forEach((p,i) => {
+            const cls = i < ai ? 'done' : i === ai ? 'active' : '';
+            h += `<div class="phase-step ${cls}"><div class="phase-dot"></div>${labels[i]}</div>`;
+            if (i < phases.length-1) h += '<div class="phase-line"></div>';
+        });
+        return h + '</div>';
+    }
+
+    // ─── RENDER FUNCTIONS ────────────────────────────────────────────────────
+    function renderIntro() {
+        return `${phaseBar('intro')}
+        <div class="card">
+          <div class="intro-eyebrow">Pre-Proposal Intelligence \u00B7 Rep Diagnostic</div>
+          <h1 class="intro-headline spp-heading">What do you not know<br>about this deal <em>right now</em>?</h1>
+          <p class="intro-body">Most failed proposals weren\u2019t failed pitches \u2014 they were built on discovery that was never actually confirmed. The Discovery Gap Profiler runs 15 questions across five dimensions of what a rep should know before building anything further, and returns a complete, evidence-based read on exactly where assumption has replaced verified fact \u2014 before that gap shows up in a lost deal.</p>
+          <div class="value-props">
+            <div class="value-prop"><div class="value-prop-label">5 Dimensions \u00B7 15 Questions</div><div class="value-prop-text">Pain Verification, Decision Criteria, Buying Process, Success Definition, and Political Mapping. Built to expose assumption, not just confirm it.</div></div>
+            <div class="value-prop"><div class="value-prop-label">5 Named Archetypes</div><div class="value-prop-text">The Template Pitch, The Assumed Ally, The Process Blind Spot, The Surface Scan, The Political Blindfold. Each with a full threat profile and specific next moves.</div></div>
+            <div class="value-prop"><div class="value-prop-label">Discovery Action Card</div><div class="value-prop-text">A clear recommendation \u2014 proceed, confirm gaps, return to discovery, or restart \u2014 plus the exact questions to ask before the next step.</div></div>
+          </div>
+          <div class="cta-row">
+            <button class="btn-primary" id="btn-start">Profile a deal\u2019s discovery \u2192</button>
+            <button class="btn-ghost" id="btn-sample">See a sample read</button>
+          </div>
+        </div>`;
+    }
+
+    function renderContext() {
+        const c = state.context;
+        return `${phaseBar('context')}
+        <div class="card">
+          <div class="section-label">Deal Context</div>
+          <h2 class="section-title spp-heading">Tell me about this deal</h2>
+          <p class="section-desc">These details anchor the diagnostic and appear in the Discovery Action Card.</p>
+          <div class="form-grid">
+            <div class="form-group"><label class="form-label">Rep name</label><input class="form-input" id="ctx-rep" type="text" placeholder="e.g. Alex Rivera" value="${c.repName||''}"></div>
+            <div class="form-group"><label class="form-label">Deal size</label><select class="form-select" id="ctx-size">${DEAL_SIZES.map(s=>`<option ${c.dealSize===s?'selected':''}>${s}</option>`).join('')}</select></div>
+            <div class="form-group"><label class="form-label">Current stage</label><select class="form-select" id="ctx-stage">${STAGES.map(s=>`<option ${c.stage===s?'selected':''}>${s}</option>`).join('')}</select></div>
+            <div class="form-group"><label class="form-label">Industry</label><select class="form-select" id="ctx-industry">${INDUSTRIES.map(s=>`<option ${c.industry===s?'selected':''}>${s}</option>`).join('')}</select></div>
+            <div class="form-group full"><label class="form-label">What\u2019s the one thing about this deal you\u2019re least sure you actually know?</label><textarea class="form-textarea" id="ctx-note" maxlength="500" placeholder="Be specific. This appears in the discovery action card.">${c.note||''}</textarea><div class="char-count">${(c.note||'').length}/500</div></div>
+          </div>
+          <div class="cta-row">
+            <button class="btn-primary" id="btn-to-quiz">Start the 15 questions \u2192</button>
+            <button class="btn-ghost" id="btn-back-intro">\u2190 Back</button>
+          </div>
+        </div>`;
+    }
+
+    function renderQuiz() {
+        const qi = state.currentQ; const q = QUESTIONS[qi]; const ans = state.answers[qi];
+        const totalAnswered = state.answers.filter(a=>a.letter!==null).length;
+        const pct = (totalAnswered/15)*100;
+        const dim = DIMENSIONS.find(d=>d.id===q.dim);
+        const srcDescs = {
+            observed:'I have direct evidence \u2014 the buyer told me this directly, or I have it confirmed in writing.',
+            told:'A stakeholder told me this. I am relying on secondhand information I have not independently verified.',
+            assumed:'I am inferring this. I have no direct or secondhand evidence \u2014 this is my read of the situation.'
+        };
+        const dimPills = DIMENSIONS.map(d=>{
+            const complete=d.qs.every(n=>state.answers[n-1].letter!==null);
+            const isActive=d.id===q.dim;
+            return `<div class="dim-pill ${complete?'complete':isActive?'active':''}">${d.short} ${d.label}</div>`;
+        }).join('');
+        return `${phaseBar('quiz')}
+        <div class="card">
+          <div class="dim-nav">${dimPills}</div>
+          <div class="quiz-progress-bar"><div class="quiz-progress-fill" style="width:${pct}%"></div></div>
+          <div class="quiz-progress-label">${totalAnswered} of 15 answered</div>
+          <div class="dim-label-eyebrow">${dim.label}</div>
+          <div class="dim-context-note">${dim.context}</div>
+          <div class="question-number">Question ${q.n} of 15</div>
+          <h2 class="question-title spp-heading">${q.title}</h2>
+          ${q.probe?`<div class="question-probe">\u21B3 ${q.probe}</div>`:''}
+          <div class="answer-options">
+            ${q.options.map(opt=>`<div class="answer-option ${ans.letter===opt.letter?'selected':''}" data-letter="${opt.letter}"><span class="answer-letter">${opt.letter}</span><span class="answer-text">${opt.text}</span></div>`).join('')}
+          </div>
+          ${ans.letter!==null?`<div class="source-tagger"><div class="source-label">How do you know this? This affects the evidence quality flag in the result.</div><div class="source-chips"><div class="source-chip ${ans.source==='observed'?'active':''}" data-source="observed">Observed</div><div class="source-chip ${ans.source==='told'?'active':''}" data-source="told">Told</div><div class="source-chip ${ans.source==='assumed'?'active':''}" data-source="assumed">Assumed</div></div><div class="source-desc">${srcDescs[ans.source]}</div></div>`:''}
+          <div class="quiz-nav">
+            <button class="btn-back" id="btn-q-back">${qi===0?'\u2190 Context':'\u2190 Previous'}</button>
+            <button class="btn-next" id="btn-q-next" ${ans.letter?'':'disabled'}>${qi===14?'See the discovery read \u2192':'Next \u2192'}</button>
+          </div>
+        </div>`;
+    }
+
+    function renderResult() {
+        const r=state.result; const ctx=state.context; const bc=BAND_COPY[r.band];
+        const rec=getDiscoveryRec(r.total);
+        const debriefQs=getDebriefQuestions(r,state.answers);
+        const riskPills=getDebriefRisks(r);
+        const debriefActions=getDebriefActions(r,ctx);
+        const dealNarrative=getDealNarrative(r,ctx,state.answers);
+        const triggered=r.triggeredArchetypes;
+        const dimSevClass=v=>v<=1?'sev-1':v<=2?'sev-2':v<=3?'sev-3':'sev-4';
+        const prev=getPreviousRun();
+        let deltaHtml='';
+        if(prev&&!state.isSample){const prevDisplay=prev.displayScore!==undefined?prev.displayScore:(75-prev.total);const diff=r.displayScore-prevDisplay;if(diff>0)deltaHtml=`<span class="delta-badge down">\u25B2 ${diff} from last read</span>`;else if(diff<0)deltaHtml=`<span class="delta-badge up">\u25BC ${Math.abs(diff)} from last read</span>`;else deltaHtml=`<span class="delta-badge same">\u2014 unchanged</span>`;}
+        const repLabel=ctx.repName?`${ctx.repName} \u00B7 `:'';
+        const dimRiskTag=id=>{const ds=r.dimScores[id];const pct=(ds.total/ds.max)*100;if(pct>65)return '<span class="dim-risk-tag high">High risk</span>';if(pct>45)return '<span class="dim-risk-tag med">Watch</span>';return '<span class="dim-risk-tag low">Solid</span>';};
+        return `${phaseBar('result')}
+        <div class="full-reveal-tag">\u2726 Full discovery read \u2014 No paywall.</div>
+        <div class="score-card ${r.band}">
+          <div class="score-top">
+            <div><div class="score-number spp-heading"><span id="score-display">0</span><span class="score-denom">/60</span><span class="tip-icon">?<span class="tip-bubble"><strong>Discovery Confidence Score</strong><br>Higher is more confirmed, less assumed. Calculated from 15 questions across 5 dimensions.<br><br><strong>48\u201360</strong> Discovery Solid<br><strong>33\u201347</strong> Discovery Gaps<br><strong>15\u201332</strong> Discovery Blind</span></span>${deltaHtml}</div><div class="score-sublabel">Discovery Confidence Score \u2014 higher is more confirmed</div></div>
+            <div class="band-pill ${r.band}" id="band-pill">${bc.band}</div>
+          </div>
+          <div class="score-headline spp-heading" id="score-headline">${bc.headline}</div>
+          <div class="score-body" id="score-body">${bc.body}</div>
+        </div>
+        <div class="card card-sm">
+          <div class="section-header"><div class="section-title-sm spp-heading">Five-dimension exposure map</div><div style="font-size:11px;color:var(--muted-3);letter-spacing:0.05em;text-transform:uppercase;">1 = Low \u00B7 4 = High</div></div>
+          ${DIMENSIONS.map(dim=>{const ds=r.dimScores[dim.id];const dimPct=Math.round((ds.total/ds.max)*100);const dimCls=dimPct<=33?'sev-1':dimPct<=55?'sev-2':dimPct<=75?'sev-3':'sev-4';const narrative=getDimNarrative(dim.id,dimPct);return `<div class="dim-block"><div class="dim-block-header"><div class="dim-block-name">${dim.label}</div><div class="dim-block-score-wrap">${dimRiskTag(dim.id)}<div class="dim-block-score ${dimCls} has-tip">${ds.total}/${ds.max}<span class="tip-bubble"><strong>Exposure subtotal</strong><br>Sum of this dimension\u2019s 3 questions (1\u20134 each). Higher = more assumption, less verification.</span></div></div></div>${narrative?`<div class="dim-narrative">${narrative}</div>`:''} ${dim.qs.map((qn,i)=>{const val=ds.scores[i];const sc=dimSevClass(val);return `<div class="dim-row"><div class="dim-label">${DIM_Q_LABELS[qn]}</div><div class="dim-bar-track"><div class="dim-bar-fill ${sc}" style="width:0%" data-target-width="${(val/4)*100}%"></div></div><div class="dim-score ${sc}">${val}</div></div>`;}).join('')}</div>`;}).join('')}
+        </div>
+        ${r.sourceQuality.flagged?`<div class="flag-card"><div class="flag-icon">\u26A0</div><div style="flex:1"><div class="flag-title">Evidence quality alert \u2014 confidence exceeds verified discovery</div><div class="flag-body">${r.sourceQuality.toldOrAssumed} of ${r.sourceQuality.highExposureAnswers} high-risk signals in this read are based on secondhand information or assumption \u2014 not direct buyer confirmation. The specific gaps where evidence is weakest:</div><div class="flag-items">${r.sourceQuality.highItems.filter(i=>i.source!=='observed').map(i=>`<div class="flag-item">Q${i.q}: ${i.label} \u2014 marked as <strong>${i.source}</strong></div>`).join('')}</div></div></div>`:''}
+        <div class="debrief-card">
+          <div class="debrief-header">
+            <div><div class="debrief-eyebrow">Discovery Action Card</div><div class="debrief-title spp-heading">${repLabel}${ctx.dealSize}</div><div class="debrief-subtitle">${ctx.stage} \u00B7 ${ctx.industry}</div></div>
+            <div class="forecast-rec-badge"><div class="forecast-rec-label">Discovery recommendation</div><div class="forecast-rec-value ${rec.cls}">${rec.label}</div></div>
+          </div>
+          <div class="debrief-section"><div class="debrief-section-label">Deal narrative</div><div class="debrief-narrative">${dealNarrative}</div></div>
+          <div class="debrief-section"><div class="debrief-section-label">All-dimension risk assessment</div><div class="debrief-risk-row">${riskPills.map(p=>`<span class="debrief-risk-pill ${p.cls}">${p.label}</span>`).join('')}</div></div>
+          <div class="debrief-section"><div class="debrief-section-label">Ask the buyer \u2014 or yourself \u2014 these questions before the next step</div><div class="debrief-questions">${debriefQs.map((q,i)=>`<div class="debrief-q"><div class="debrief-q-num">${i+1}.</div><div><div class="debrief-q-text">${q.text}</div>${q.why?`<div class="debrief-q-why">Why this question: ${q.why}</div>`:''}</div></div>`).join('')}</div></div>
+          <div class="debrief-section"><div class="debrief-section-label">Immediate actions</div><div class="debrief-actions">${debriefActions.map(a=>`<div class="debrief-action"><div class="debrief-action-label">${a.label}</div><div class="debrief-action-text">${a.text}</div></div>`).join('')}</div></div>
+          ${ctx.note?`<div class="debrief-section" style="margin-bottom:0"><div class="debrief-section-label">Rep\u2019s stated uncertainty</div><div class="debrief-narrative" style="border-left-color:#64748B">\u201C${ctx.note}\u201D</div></div>`:''}
+        </div>
+        <div class="card card-sm">
+          <div class="section-header"><div class="section-title-sm spp-heading">Discovery archetypes detected</div><div class="archetype-count">${triggered.length} of 5</div></div>
+          ${triggered.length===0?`<div class="clean-read-banner"><div class="clean-read-title">\u2713 No discovery archetypes triggered</div><div class="clean-read-body">None of the five patterns crossed the trigger threshold. This deal\u2019s discovery signals are consistent with a verified, well-tested process. Apply these standard disciplines:</div><div class="clean-disciplines"><div class="clean-discipline">Re-confirm key assumptions any time a new stakeholder enters the deal</div><div class="clean-discipline">Keep validating the political landscape as the deal moves toward signature \u2014 dynamics shift</div><div class="clean-discipline">Document the confirmed pain, criteria, and success definition in writing with the buyer</div><div class="clean-discipline">Re-run this profiler if anything material changes \u2014 a reorg, a new approver, a shifted timeline</div></div></div>`:triggered.map(id=>{const a=ARCHETYPES[id];return `<div class="archetype-card"><div class="archetype-header" style="background:${a.color}"><div><div class="archetype-name spp-heading">${a.name}</div><div class="archetype-one-liner">${a.oneLiner}</div></div><div class="archetype-detected has-tip">Detected<span class="tip-bubble"><strong>Why this was detected</strong><br>${a.triggerPlain||''}</span></div></div><div class="archetype-body"><div class="threat-section"><div class="threat-label">What this pattern means</div><div class="threat-text">${a.threat}</div></div><div class="move-card"><div class="move-label">Next move</div><div class="move-text">${a.move}</div>${a.steps&&a.steps.length?`<div class="move-steps">${a.steps.map(s=>`<div class="move-step">${s}</div>`).join('')}</div>`:''}</div></div><div class="trigger-caption">Detected by: ${a.trigger}</div></div>`;}).join('')}
+        </div>
+        <div class="context-recap"><div class="section-label" style="margin-bottom:8px">Deal context</div><div class="recap-pills">${ctx.repName?`<div class="recap-pill">${ctx.repName}</div>`:''}<div class="recap-pill">${ctx.dealSize}</div><div class="recap-pill">${ctx.stage}</div><div class="recap-pill">${ctx.industry}</div></div>${ctx.note?`<div class="recap-note">\u201C${ctx.note}\u201D</div>`:''}</div>
+        <div class="contingency-banner">
+          <div class="contingency-banner-eyebrow">Stage 2 \u2014 Available Now</div>
+          <h3 class="contingency-banner-headline spp-heading">Contingency Briefing</h3>
+          <p class="contingency-banner-body">Lead generation tools fill a pipeline. Workflow tools book a meeting. Neither one can tell you what happens when the plan dies in the room at minute twelve of a C-suite conversation. The Contingency Briefing is built for exactly that moment.</p>
+          <button class="btn-primary" id="btn-to-contingency" style="font-size:14px;padding:14px 28px;">Generate Contingency Briefing \u2192</button>
+        </div>
+        <div class="result-footer">
+          <button class="btn-ghost" id="btn-reset">Profile another deal</button>
+          <button class="btn-share" onclick="shareResult()"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 1.5L12.5 5L9 8.5M12.5 5H5.5C3.8 5 2.5 6.3 2.5 8V12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg> Copy debrief</button>
+          <button class="btn-download-result" onclick="downloadApp()"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1v8.5M7 9.5L4.5 7M7 9.5L9.5 7M1.5 11.5h11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg> Save to device</button>
+        </div>`;
+    }
+
+    // ─── CONTINGENCY RENDER ───────────────────────────────────────────────────
+    function renderContingency() {
+        const inp=state.contingencyInputs; const res=state.contingencyResult;
+        const loading=state.contingencyLoading; const r=state.result; const ctx=state.context;
+        const archetypeNames=r.triggeredArchetypes.map(id=>ARCHETYPES[id].name).join(', ');
+        const recapPills=[ctx.repName?ctx.repName:null,ctx.dealSize,ctx.stage,ctx.industry,`${BAND_COPY[r.band].band} \u00B7 ${r.displayScore}/60`].filter(Boolean).map(p=>`<span class="recap-pill">${p}</span>`).join('');
+        return `${phaseBar('contingency')}
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--gold);margin-bottom:12px;">Stage 2 \u2014 Contingency Briefing</div>
+          <h2 class="section-title spp-heading" style="margin-bottom:8px;">Anticipate what\u2019s coming. Own the room when the plan fails.</h2>
+          <p class="section-desc" style="margin-bottom:20px;">Three layers: the questions you can see coming, the wildcards your exec\u2019s role always throws, and the three standardized bridge lines for when nothing you prepared applies.</p>
+          <div class="context-recap" style="margin-bottom:20px;">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:${archetypeNames?'10px':'0'}">${recapPills}${archetypeNames?`<span class="recap-pill" style="background:#FEF2F2;color:#991B1B;border-color:#FECACA;">\u26D4 ${archetypeNames}</span>`:''}</div>
+          </div>
+          <div class="form-group" style="margin-bottom:16px;">
+            <label class="form-label">Executive\u2019s role / title <span style="color:var(--red)">*</span></label>
+            <input class="form-input" id="exec-role" type="text" placeholder="e.g. CEO, CRO, CFO, VP of Engineering, SVP Sales" value="${inp.execRole||''}">
+            <div style="font-size:11px;color:var(--muted-3);margin-top:4px;">Role drives Layer 2 \u2014 the questions this executive is always accountable for, regardless of what you prepared.</div>
+          </div>
+          <div class="form-group" style="margin-bottom:24px;">
+            <label class="form-label">Their top strategic priorities right now <span style="color:var(--red)">*</span></label>
+            <textarea class="form-textarea" id="exec-initiatives" placeholder="e.g. margin expansion, new EMEA market, board cycle in Q3, cost reduction..." style="min-height:90px">${inp.initiatives||''}</textarea>
+            <div style="font-size:11px;color:var(--muted-3);margin-top:4px;">The more specific, the sharper Layer 1. Even 2\u20133 initiatives produces a meaningful difference.</div>
+          </div>
+          ${loading?`<div class="gen-state"><div class="gen-spinner"></div><div class="gen-label">Generating Contingency Briefing</div><div class="gen-sub">Analyzing discovery gaps, executive role, and strategic initiatives\u2026</div></div>`:''}
+          ${(!loading&&res)?renderContingencyOutput(res):''}
+          <div class="cont-action-row">
+            ${!loading?`
+              <button class="btn-primary" id="btn-generate">${res?'Regenerate \u21BB':'Generate Contingency Briefing \u2192'}</button>
+              <button class="btn-ghost" id="btn-back-result">\u2190 Back to Discovery Read</button>
+              ${res?`<button class="btn-share" id="btn-share-briefing" style="background:var(--ink);color:white;border:none;border-radius:8px;padding:12px 20px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 1.5L12.5 5L9 8.5M12.5 5H5.5C3.8 5 2.5 6.3 2.5 8V12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Copy Briefing</button>`:''}
+            `:''}
+          </div>
+        </div>`;
+    }
+
+    function renderContingencyOutput(res) {
+        if (!res) return '';
+        const layer1 = res.layer1 || {};
+        const layer2 = res.layer2 || {};
+        const layer3 = res.layer3 || {};
+        return `
+        <div style="margin-bottom:8px;">
+          <div class="layer-card">
+            <div class="layer-header">
+              <div class="layer-number">1</div>
+              <div><div class="layer-title">${layer1.label||'Probable Strategic Questions'}</div><div class="layer-desc">${layer1.description||'Questions you can see coming when you reason from what drives this executive.'}</div></div>
+            </div>
+            <div class="layer-body">
+              ${(layer1.items||[]).map(item=>`<div class="layer-item"><span class="conf-badge ${(item.confidence||'Medium').toLowerCase()}">${item.confidence||'Medium'} confidence</span><div class="layer-item-q">\u201C${item.question}\u201D</div><div class="layer-item-why">\u2193 Why likely: ${item.why}</div><div class="layer-item-angle"><strong style="font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--blue);">Angle \u2192</strong> ${item.angle}</div></div>`).join('')}
+            </div>
+          </div>
+          <div class="layer-card">
+            <div class="layer-header">
+              <div class="layer-number">2</div>
+              <div><div class="layer-title">${layer2.label||'Wildcard Categories'}</div><div class="layer-desc">${layer2.description||'The shapes curveballs take for this role \u2014 recognize the type even when the wording is novel.'}</div></div>
+            </div>
+            <div class="layer-body">
+              ${(layer2.items||[]).map(item=>`<div class="layer-item"><div class="wildcard-cat">${item.category}</div><div class="wildcard-ex">\u201C${item.example}\u201D</div><div class="wildcard-fw">${item.framework}</div></div>`).join('')}
+            </div>
+          </div>
+          <div class="layer-card">
+            <div class="layer-header">
+              <div class="layer-number" style="background:var(--teal);">3</div>
+              <div><div class="layer-title">${layer3.label||'Bridge Lines \u2014 Athlete Moves'}</div><div class="layer-desc">${layer3.description||'For the moment when nothing you prepared covers what just happened in the room.'}</div></div>
+            </div>
+            <div class="layer-body">
+              ${(layer3.items||[]).map(item=>`<div class="bridge-move"><div class="bridge-move-label">${item.move}</div><div class="bridge-move-line">\u201C${item.line}\u201D</div><div class="bridge-move-when">When to use: ${item.when}</div></div>`).join('')}
+            </div>
+          </div>
+        </div>`;
+    }
+
+    // ─── EVENT HANDLERS ───────────────────────────────────────────────────────
+    function attachHandlers() {
+        const on = (id, fn) => { const el=document.getElementById(id); if(el) el.addEventListener('click', fn); };
+        on('btn-start', () => setState({phase:'context', isSample:false}));
+        on('btn-sample', () => {
+            const result=scoreRun(SAMPLE_ANS);
+            saveCurrentRun(result);
+            setState({phase:'result', isSample:true, context:SAMPLE_CTX, answers:SAMPLE_ANS, result});
+            window.scrollTo({top:0, behavior:'smooth'});
+        });
+        on('btn-to-quiz', () => {
+            const ctx={
+                repName:document.getElementById('ctx-rep')?.value||'',
+                dealSize:document.getElementById('ctx-size')?.value||state.context.dealSize,
+                stage:document.getElementById('ctx-stage')?.value||state.context.stage,
+                industry:document.getElementById('ctx-industry')?.value||state.context.industry,
+                note:document.getElementById('ctx-note')?.value||''
+            };
+            setState({phase:'quiz', currentQ:0, context:ctx});
+        });
+        on('btn-back-intro', () => setState({phase:'intro'}));
+        const noteEl=document.getElementById('ctx-note');
+        if(noteEl) noteEl.addEventListener('input', e=>{ const cc=document.querySelector('.char-count'); if(cc) cc.textContent=`${e.target.value.length}/500`; state.context.note=e.target.value; });
+        document.querySelectorAll('.answer-option').forEach(el=>{
+            el.addEventListener('click', ()=>{
+                const answers=[...state.answers];
+                answers[state.currentQ]={...answers[state.currentQ], letter:el.dataset.letter};
+                setState({answers});
+            });
+        });
+        document.querySelectorAll('.source-chip').forEach(el=>{
+            el.addEventListener('click', ()=>{
+                const answers=[...state.answers];
+                answers[state.currentQ]={...answers[state.currentQ], source:el.dataset.source};
+                setState({answers});
+            });
+        });
+        on('btn-q-back', ()=>{ if(state.currentQ===0) setState({phase:'context'}); else setState({currentQ:state.currentQ-1}); });
+        on('btn-q-next', ()=>{
+            if(state.currentQ<14){ setState({currentQ:state.currentQ+1}); }
+            else {
+                try { const result=scoreRun(state.answers); saveCurrentRun(result); setState({phase:'result', result}); window.scrollTo({top:0,behavior:'smooth'}); }
+                catch(e) { alert('Please answer all 15 questions.'); }
+            }
+        });
+        on('btn-reset', ()=>{
+            setState({phase:'intro', isSample:false,
+                context:{repName:'', dealSize:'$100K\u2013$250K', stage:'Discovery', industry:'SaaS / Software', note:''},
+                answers:Array.from({length:15},(_,i)=>({questionN:i+1,letter:null,source:'observed'})),
+                currentQ:0, result:null,
+                contingencyResult:null, contingencyLoading:false,
+                contingencyInputs:{execRole:'', initiatives:''}
+            });
+            window.scrollTo({top:0, behavior:'smooth'});
+        });
+        // Contingency handlers
+        on('btn-to-contingency', ()=>setState({phase:'contingency'}));
+        on('btn-back-result', ()=>setState({phase:'result'}));
+        on('btn-generate', ()=>generateContingencyBriefing());
+        on('btn-share-briefing', ()=>shareBriefing());
+    }
+
+    function runWowSequence() {
+        const r=state.result;
+        const scoreEl=document.getElementById('score-display');
+        const bandEl=document.getElementById('band-pill');
+        const headEl=document.getElementById('score-headline');
+        const bodyEl=document.getElementById('score-body');
+        if(scoreEl){
+            let cur=0; const steps=30; const inc=r.displayScore/steps; const intv=900/steps;
+            const timer=setInterval(()=>{
+                cur=Math.min(cur+inc,r.displayScore);
+                scoreEl.textContent=Math.round(cur);
+                if(cur>=r.displayScore){
+                    clearInterval(timer); scoreEl.textContent=r.displayScore;
+                    setTimeout(()=>{ if(bandEl) bandEl.classList.add('revealed'); },120);
+                    setTimeout(()=>{ if(headEl) headEl.classList.add('revealed'); setTimeout(()=>{ if(bodyEl) bodyEl.classList.add('revealed'); },100); },280);
+                }
+            },intv);
+        }
+        setTimeout(()=>{
+            document.querySelectorAll('.dim-bar-fill[data-target-width]').forEach((el,i)=>{
+                setTimeout(()=>{ el.style.width=el.dataset.targetWidth; },i*45);
+            });
+        },700);
+        setTimeout(()=>{
+            document.querySelectorAll('.archetype-card').forEach((card,i)=>{
+                setTimeout(()=>{ card.classList.add('detected'); setTimeout(()=>card.classList.add('pulse'),50); },i*380);
+            });
+        },1100);
+    }
+
+    // ─── SHARE & STORAGE ─────────────────────────────────────────────────────
+    function shareResult() {
+        const r=state.result; const ctx=state.context; const bc=BAND_COPY[r.band];
+        const rec=getDiscoveryRec(r.total);
+        const debriefQs=getDebriefQuestions(r,state.answers);
+        const riskPills=getDebriefRisks(r);
+        const archetypeNames=r.triggeredArchetypes.map(id=>ARCHETYPES[id].name).join(' + ')||'None detected';
+        const repLine=ctx.repName?`Rep: ${ctx.repName}\n`:'';
+        const flagLine=r.sourceQuality.flagged?`\n\u26A0 EVIDENCE ALERT: ${r.sourceQuality.toldOrAssumed}/${r.sourceQuality.highExposureAnswers} high-risk signals are secondhand or assumed.\nGaps: ${r.sourceQuality.highItems.filter(i=>i.source!=='observed').map(i=>i.label).join(', ')}\n`:'';
+        const text=`\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+DISCOVERY GAP PROFILER\u2122 \u2014 DISCOVERY ACTION CARD
+The Sales Athlete System\u2122 \u00B7 Netoria, Inc.
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+${repLine}Deal: ${ctx.dealSize} \u00B7 ${ctx.stage} \u00B7 ${ctx.industry}
+${ctx.note?`Uncertainty: "${ctx.note}"\n`:''}
+SCORE: ${r.displayScore}/60 (Discovery Confidence) \u2014 ${bc.band}
+RECOMMENDATION: ${rec.label}
+${rec.text}
+${flagLine}
+DIMENSION RISK:
+${riskPills.map(p=>p.label).join(' \u00B7 ')}
+
+ARCHETYPES: ${archetypeNames}
+
+QUESTIONS TO ASK NEXT:
+${debriefQs.map((q,i)=>`${i+1}. ${q.text}`).join('\n\n')}
+
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+The Sales Athlete System\u2122 \u00B7 Netoria, Inc.
+Discovery Gap Profiler\u2122 \u00B7 thementoredge.com`;
+        const toast=document.getElementById('share-toast');
+        const show=msg=>{ if(toast){ toast.textContent=msg; toast.classList.add('visible'); setTimeout(()=>toast.classList.remove('visible'),3000); } };
+        navigator.clipboard.writeText(text).then(()=>show('\u2713 Discovery action card copied to clipboard')).catch(()=>{
+            const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);show('\u2713 Discovery action card copied to clipboard');
+        });
+    }
+
+    function saveCurrentRun(r) {
+        try { localStorage.setItem('dgp_last_run', JSON.stringify({total:r.total,displayScore:r.displayScore,band:r.band,triggeredArchetypes:r.triggeredArchetypes,ts:Date.now()})); } catch(e) {}
+    }
+    function getPreviousRun() {
+        try { const raw=localStorage.getItem('dgp_last_run'); if(!raw) return null; const run=JSON.parse(raw); if(Date.now()-run.ts>30*24*60*60*1000) return null; return run; } catch(e) { return null; }
+    }
+
+    function downloadApp() {
+        const source='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
+        const toast=document.getElementById('share-toast');
+        const show=msg=>{ if(toast){ toast.textContent=msg; toast.classList.add('visible'); setTimeout(()=>toast.classList.remove('visible'),3000); } };
+        show('Preparing download\u2026');
+        try {
+            const blob=new Blob([source],{type:'text/html;charset=utf-8'});
+            const url=URL.createObjectURL(blob);
+            const a=document.createElement('a'); a.href=url; a.download='discovery-gap-profiler.html'; a.style.display='none'; document.body.appendChild(a);
+            if(window.self!==window.top){ a.target='_blank'; a.rel='noopener'; a.click(); show('Opened in new tab \u2014 use File \u2192 Save As'); }
+            else { a.click(); show('\u2713 Downloading discovery-gap-profiler.html'); }
+            setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },500);
+        } catch(e) { show('Use File \u2192 Save Page As in your browser'); }
+    }
+
+    // ─── CONTINGENCY BRIEFING AI FUNCTIONS ───────────────────────────────────
+    async function callClaudeAPI(prompt) {
+        // When running inside claude.ai artifact iframe, use the bridge
+        const runningStandalone = window.self === window.top;
+        if (!runningStandalone && window.claude && window.claude.complete) {
+            return await window.claude.complete(prompt);
+        }
+        // Standalone / Netlify: use the private streaming Edge Function (native fetch, bypassing the hijacked bridge fetch)
+        const response = await window.__nativeFetch('/api/claude-proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt })
+        });
+        const rawText = await response.text();
+        if (!response.ok) {
+            let errMsg = `Request failed: ${response.status}`;
+            try { errMsg = JSON.parse(rawText).error || errMsg; } catch (e) {}
+            throw new Error(errMsg);
+        }
+        return rawText;
+    }
+
+    function extractJSON(raw) {
+        if (!raw) throw new Error('Empty response from Claude.');
+        let clean = raw.replace(/```json|```/g, '').trim();
+        try {
+            return JSON.parse(clean);
+        } catch (e) {
+            const start = clean.indexOf('{');
+            const end = clean.lastIndexOf('}');
+            if (start !== -1 && end !== -1 && end > start) {
+                try {
+                    return JSON.parse(clean.slice(start, end + 1));
+                } catch (e2) {
+                    throw new Error('Could not parse the response as JSON. Please try again.');
+                }
+            }
+            throw new Error('Could not parse the response as JSON. Please try again.');
+        }
+    }
+
+    function buildContingencyPrompt(execRole, initiatives) {
+        const r = state.result;
+        const ctx = state.context;
+        const gapDims = DIMENSIONS
+            .filter(d => (r.dimScores[d.id].total / r.dimScores[d.id].max) > 0.45)
+            .map(d => d.label);
+        const archetypes = r.triggeredArchetypes.map(id => ARCHETYPES[id].name).join(', ') || 'None';
+        return `You are the Sales Athlete System\u2122 by Netoria, Inc. Generate a Contingency Briefing for a sales rep preparing for an executive conversation.
+
+DEAL CONTEXT:
+- Rep: ${ctx.repName || 'Not specified'}
+- Deal size: ${ctx.dealSize}
+- Stage: ${ctx.stage}
+- Industry: ${ctx.industry}
+- Discovery band: ${BAND_COPY[r.band].band} (${r.displayScore}/60)
+- Archetypes detected: ${archetypes}
+- Discovery gaps in: ${gapDims.length ? gapDims.join(', ') : 'None critical'}
+
+EXECUTIVE TARGET:
+- Role/Title: ${execRole}
+- Strategic priorities: ${initiatives}
+
+Generate a 3-layer Contingency Briefing. Return ONLY valid JSON. No preamble, no markdown backticks, no explanation.
+
+Layer 1: 4-5 questions the executive is likely to ask, derived from their stated priorities AND the rep's discovery gaps. Each needs: question, why (why it's likely given their role + priorities), angle (how the rep should address it), confidence (High or Medium only).
+
+Layer 2: 3-4 wildcard categories \u2014 patterns of questions this specific executive role always throws, regardless of prep. Each needs: category, example (an actual question they might say), framework (how to recognize and handle it).
+
+Layer 3: Exactly these 3 bridge lines with customized content: "Slow down on purpose", "Get curious before clever", "The honest power move". For each: move (the name), line (a specific, non-generic line to say in this deal's context), when (the precise situation that calls for it in this conversation).
+
+Voice: Direct, practitioner-grounded, no filler. This is for a sales athlete, not a student.
+
+{
+  "layer1": {
+    "label": "Probable Strategic Questions",
+    "description": "Questions you can see coming when you reason from what drives this executive.",
+    "items": [
+      {"question": "...", "why": "...", "angle": "...", "confidence": "High"}
+    ]
+  },
+  "layer2": {
+    "label": "Role-Based Wildcards",
+    "description": "The shapes curveballs take for this role \u2014 recognize the type even when the wording is novel.",
+    "items": [
+      {"category": "...", "example": "...", "framework": "..."}
+    ]
+  },
+  "layer3": {
+    "label": "Bridge Lines \u2014 Athlete Moves",
+    "description": "For the moment when nothing you prepared covers what just happened in the room.",
+    "items": [
+      {"move": "Slow down on purpose", "line": "...", "when": "..."},
+      {"move": "Get curious before clever", "line": "...", "when": "..."},
+      {"move": "The honest power move", "line": "...", "when": "..."}
+    ]
+  }
+}`;
+    }
+
+    async function generateContingencyBriefing() {
+        const execRole = document.getElementById('exec-role')?.value?.trim() || '';
+        const initiatives = document.getElementById('exec-initiatives')?.value?.trim() || '';
+        if (!execRole || !initiatives) {
+            alert('Please enter the executive\u2019s role and their strategic priorities.');
+            return;
+        }
+        setState({
+            contingencyInputs: { execRole, initiatives },
+            contingencyLoading: true,
+            contingencyResult: null
+        });
+        try {
+            const prompt = buildContingencyPrompt(execRole, initiatives);
+            const raw = await callClaudeAPI(prompt);
+            const result = extractJSON(raw);
+            setState({ contingencyLoading: false, contingencyResult: result });
+        } catch(e) {
+            console.error('Contingency briefing error:', e);
+            setState({ contingencyLoading: false });
+            alert('Generation failed: ' + e.message + '\n\nPlease try again.');
+        }
+    }
+
+    function shareBriefing() {
+        const res = state.contingencyResult;
+        if (!res) return;
+        const ctx = state.context;
+        const inp = state.contingencyInputs;
+        const r = state.result;
+        const repLine = ctx.repName ? `Rep: ${ctx.repName}\n` : '';
+        const layer1Items = (res.layer1?.items||[]).map((item,i)=>`${i+1}. [${item.confidence}] "${item.question}"\n   Why: ${item.why}\n   Angle: ${item.angle}`).join('\n\n');
+        const layer2Items = (res.layer2?.items||[]).map(item=>`${item.category}\n   "${item.example}"\n   ${item.framework}`).join('\n\n');
+        const layer3Items = (res.layer3?.items||[]).map(item=>`${item.move}: "${item.line}"\nWhen: ${item.when}`).join('\n\n');
+        const text = `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+DISCOVERY GAP PROFILER\u2122 \u2014 CONTINGENCY BRIEFING
+The Sales Athlete System\u2122 \u00B7 Netoria, Inc.
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+${repLine}Deal: ${ctx.dealSize} \u00B7 ${ctx.stage} \u00B7 ${ctx.industry}
+Executive: ${inp.execRole}
+Their priorities: ${inp.initiatives}
+Discovery: ${BAND_COPY[r.band].band} \u00B7 ${r.displayScore}/60
+
+LAYER 1 \u2014 ${res.layer1?.label||'Probable Strategic Questions'}
+${layer1Items}
+
+LAYER 2 \u2014 ${res.layer2?.label||'Role-Based Wildcards'}
+${layer2Items}
+
+LAYER 3 \u2014 ${res.layer3?.label||'Bridge Lines'}
+${layer3Items}
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+The Sales Athlete System\u2122 \u00B7 Netoria, Inc.`;
+        const toast = document.getElementById('share-toast');
+        const show = msg => { if(toast){ toast.textContent=msg; toast.classList.add('visible'); setTimeout(()=>toast.classList.remove('visible'),3000); } };
+        navigator.clipboard.writeText(text).then(()=>show('\u2713 Contingency briefing copied')).catch(()=>{
+            const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);show('\u2713 Contingency briefing copied');
+        });
+    }
+
+    // ─── BOOTSTRAP ────────────────────────────────────────────────────────────
+    render();
+    </script>
+</body>
+</html>
